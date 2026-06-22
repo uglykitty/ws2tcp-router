@@ -23,6 +23,44 @@ Text WebSocket frames are also accepted and forwarded to TCP as UTF-8 bytes.
 cargo build --release
 ```
 
+## Docker
+
+Published images are available from GitHub Container Registry:
+
+```bash
+podman pull ghcr.io/uglykitty/ws2tcp-router:0.1.2
+podman run --rm -p 22345:22345 ghcr.io/uglykitty/ws2tcp-router:0.1.2
+```
+
+Build the image:
+
+```bash
+docker build -t ws2tcp-router .
+```
+
+Run with the default listener on port `22345`:
+
+```bash
+docker run --rm -p 22345:22345 ws2tcp-router
+```
+
+Pass any CLI option after the image name:
+
+```bash
+docker run --rm -p 22345:22345 ws2tcp-router --bind 0.0.0.0 --port 22345
+docker run --rm -p 22345:22345 -e RUST_LOG=ws2tcp_router=debug ws2tcp-router
+```
+
+Docker images are published by GitHub Actions when a version tag is pushed:
+
+```bash
+git tag v0.1.2
+git push origin v0.1.2
+```
+
+After the first publish, set the package visibility to public in GitHub if the
+image should be pullable without authentication.
+
 ## Run
 
 Bind on all interfaces and port `22345`:
