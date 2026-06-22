@@ -776,6 +776,7 @@ dependencies = [
  "anyhow",
  "clap",
  "futures-util",
+ "socket2",
  "tokio",
  "tokio-tungstenite",
  "tracing",

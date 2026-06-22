@@ -28,13 +28,20 @@ cargo build --release
 Bind on all interfaces and port `22345`:
 
 ```bash
-cargo run -- --bind 0.0.0.0 --port 22345
+cargo run -- --bind :: --port 22345
+```
+
+Bind on IPv6 only:
+
+```bash
+cargo run -- --bind :: --port 22345 --ipv6-only
 ```
 
 Bind on a specific address:
 
 ```bash
 cargo run -- --bind 10.15.108.29 --port 22345
+cargo run -- --bind 2001:db8::10 --port 22345
 ```
 
 Then connect with a WebSocket client:
@@ -46,15 +53,20 @@ ws://10.15.108.29:22345/tcp:116.63.8.64:12345
 ## Options
 
 ```text
---bind <ADDR>          Address to bind the WebSocket server to. Default: 0.0.0.0
+--bind <ADDR>          Address to bind the WebSocket server to. Default: ::
 --port <PORT>          Port to bind the WebSocket server to. Default: 22345
+--ipv6-only            Only accept IPv6 connections when binding an IPv6 address.
 --buffer-size <BYTES>  TCP read buffer size. Default: 16384
 ```
+
+When binding an IPv6 address without `--ipv6-only`, the listener allows dual-stack
+operation where the operating system supports it. Use `--ipv6-only` to reject
+IPv4-mapped connections.
 
 Logging is controlled with `RUST_LOG`:
 
 ```bash
-RUST_LOG=ws2tcp_router=debug cargo run -- --bind 0.0.0.0 --port 22345
+RUST_LOG=ws2tcp_router=debug cargo run -- --bind :: --port 22345
 ```
 
 ## Path Format
@@ -65,9 +77,16 @@ The request path must be:
 /tcp:<host>:<port>
 ```
 
+IPv6 upstream addresses must be enclosed in brackets:
+
+```text
+/tcp:[<ipv6-address>]:<port>
+```
+
 Examples:
 
 ```text
 /tcp:116.63.8.64:12345
 /tcp:example.com:80
+/tcp:[2001:db8::1]:443
 ```

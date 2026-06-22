@@ -1,11 +1,12 @@
 use std::{
-    net::{SocketAddr, ToSocketAddrs},
+    net::{IpAddr, SocketAddr, ToSocketAddrs},
     sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -27,12 +28,16 @@ use tracing::{debug, info, warn};
 )]
 struct Args {
     /// Address to bind the WebSocket server to.
-    #[arg(long, default_value = "0.0.0.0")]
+    #[arg(long, default_value = "::")]
     bind: String,
 
     /// Port to bind the WebSocket server to.
     #[arg(long, default_value_t = 22345)]
     port: u16,
+
+    /// Only accept IPv6 connections when binding an IPv6 address.
+    #[arg(long)]
+    ipv6_only: bool,
 
     /// Maximum TCP read buffer size in bytes.
     #[arg(long, default_value_t = 16 * 1024)]
@@ -66,9 +71,7 @@ async fn main() -> Result<()> {
     }
 
     let bind_addr = resolve_bind_addr(&args.bind, args.port)?;
-    let listener = TcpListener::bind(bind_addr)
-        .await
-        .with_context(|| format!("failed to bind {bind_addr}"))?;
+    let listener = bind_listener(bind_addr, args.ipv6_only).await?;
 
     info!("listening on ws://{bind_addr}");
 
@@ -134,7 +137,8 @@ fn capture_requested_target(
                 "rejecting websocket request"
             );
             Err(ErrorResponse::new(Some(
-                "path must be /tcp:<host>:<port>".to_owned(),
+                "path must be /tcp:<host>:<port>, with IPv6 hosts formatted as [host]:port"
+                    .to_owned(),
             )))
         }
     }
@@ -202,14 +206,58 @@ fn resolve_bind_addr(host: &str, port: u16) -> Result<SocketAddr> {
         .ok_or_else(|| anyhow!("bind address {host}:{port} did not resolve"))
 }
 
+async fn bind_listener(bind_addr: SocketAddr, ipv6_only: bool) -> Result<TcpListener> {
+    match bind_addr.ip() {
+        IpAddr::V4(_) => {
+            if ipv6_only {
+                bail!("--ipv6-only requires an IPv6 bind address");
+            }
+
+            TcpListener::bind(bind_addr)
+                .await
+                .with_context(|| format!("failed to bind {bind_addr}"))
+        }
+        IpAddr::V6(_) => {
+            let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))
+                .context("failed to create IPv6 TCP socket")?;
+            socket
+                .set_only_v6(ipv6_only)
+                .context("failed to set IPV6_V6ONLY")?;
+            socket
+                .bind(&bind_addr.into())
+                .with_context(|| format!("failed to bind {bind_addr}"))?;
+            socket.listen(1024).context("failed to listen")?;
+            socket
+                .set_nonblocking(true)
+                .context("failed to set listener nonblocking")?;
+
+            TcpListener::from_std(socket.into()).context("failed to create tokio listener")
+        }
+    }
+}
+
 fn parse_target(path: &str) -> Result<Target> {
     let target = path
         .strip_prefix("/tcp:")
         .ok_or_else(|| anyhow!("path must start with /tcp:"))?;
 
-    let (host, port) = target
-        .rsplit_once(':')
-        .ok_or_else(|| anyhow!("target must be formatted as host:port"))?;
+    let (host, port) = if let Some(rest) = target.strip_prefix('[') {
+        let (host, port) = rest
+            .split_once("]:")
+            .ok_or_else(|| anyhow!("IPv6 target must be formatted as [host]:port"))?;
+        if host.is_empty() {
+            bail!("target host is empty");
+        }
+        (format!("[{host}]"), port)
+    } else {
+        let (host, port) = target
+            .rsplit_once(':')
+            .ok_or_else(|| anyhow!("target must be formatted as host:port"))?;
+        if host.contains(':') {
+            bail!("IPv6 target must be enclosed in brackets");
+        }
+        (host.to_owned(), port)
+    };
 
     if host.is_empty() {
         bail!("target host is empty");
@@ -219,10 +267,7 @@ fn parse_target(path: &str) -> Result<Target> {
         .parse::<u16>()
         .with_context(|| format!("invalid target port {port:?}"))?;
 
-    Ok(Target {
-        host: host.to_owned(),
-        port,
-    })
+    Ok(Target { host, port })
 }
 
 #[cfg(test)]
@@ -237,10 +282,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_bracketed_ipv6_target_from_path() {
+        let target = parse_target("/tcp:[2001:db8::1]:443").unwrap();
+        assert_eq!(target.host, "[2001:db8::1]");
+        assert_eq!(target.port, 443);
+        assert_eq!(target.addr(), "[2001:db8::1]:443");
+    }
+
+    #[test]
     fn rejects_invalid_path() {
         assert!(parse_target("/http:116.63.8.64:12345").is_err());
         assert!(parse_target("/tcp:116.63.8.64").is_err());
         assert!(parse_target("/tcp::12345").is_err());
+        assert!(parse_target("/tcp:2001:db8::1:443").is_err());
+        assert!(parse_target("/tcp:[]:443").is_err());
+        assert!(parse_target("/tcp:[2001:db8::1]443").is_err());
         assert!(parse_target("/tcp:116.63.8.64:not-a-port").is_err());
     }
 }
