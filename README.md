@@ -28,8 +28,8 @@ cargo build --release
 Published images are available from GitHub Container Registry:
 
 ```bash
-podman pull ghcr.io/uglykitty/ws2tcp-router:0.1.2
-podman run --rm -p 22345:22345 ghcr.io/uglykitty/ws2tcp-router:0.1.2
+podman pull ghcr.io/uglykitty/ws2tcp-router:0.1.3
+podman run --rm -p 22345:22345 ghcr.io/uglykitty/ws2tcp-router:0.1.3
 ```
 
 Build the image:
@@ -51,12 +51,22 @@ docker run --rm -p 22345:22345 ws2tcp-router --bind 0.0.0.0 --port 22345
 docker run --rm -p 22345:22345 -e RUST_LOG=ws2tcp_router=debug ws2tcp-router
 ```
 
-Docker images are published by GitHub Actions when a version tag is pushed:
+Docker images and GitHub Release binaries are published by GitHub Actions when
+a version tag is pushed:
 
 ```bash
-git tag v0.1.2
-git push origin v0.1.2
+git tag v0.1.3
+git push origin v0.1.3
 ```
+
+The Release contains single-file executables:
+
+- `ws2tcp-router-linux-x86_64`
+- `ws2tcp-router-linux-arm64`
+- `ws2tcp-router-windows-x86_64.exe`
+- `ws2tcp-router-windows-arm64.exe`
+- `ws2tcp-router-macos-x86_64`
+- `ws2tcp-router-macos-arm64`
 
 After the first publish, set the package visibility to public in GitHub if the
 image should be pullable without authentication.

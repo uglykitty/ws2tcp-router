@@ -1,0 +1,94 @@
+name: Publish binary release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN_NAME: ws2tcp-router
+
+jobs:
+  build:
+    name: Build ${{ matrix.asset_name }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset_name: ws2tcp-router-linux-x86_64
+            bin_ext: ""
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset_name: ws2tcp-router-linux-arm64
+            bin_ext: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset_name: ws2tcp-router-windows-x86_64
+            bin_ext: ".exe"
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            asset_name: ws2tcp-router-windows-arm64
+            bin_ext: ".exe"
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            asset_name: ws2tcp-router-macos-x86_64
+            bin_ext: ""
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset_name: ws2tcp-router-macos-arm64
+            bin_ext: ""
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+
+      - name: Build binary
+        run: cargo +stable build --locked --release --target ${{ matrix.target }}
+
+      - name: Prepare binary
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist
+          Copy-Item "target/${{ matrix.target }}/release/${env:BIN_NAME}${{ matrix.bin_ext }}" "dist/${{ matrix.asset_name }}${{ matrix.bin_ext }}"
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: dist/${{ matrix.asset_name }}${{ matrix.bin_ext }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "${TAG_NAME}" >/dev/null 2>&1; then
+            gh release upload "${TAG_NAME}" dist/* --clobber
+          else
+            gh release create "${TAG_NAME}" dist/* --title "${TAG_NAME}" --generate-notes
+          fi
