@@ -28,8 +28,8 @@ cargo build --release
 Published images are available from GitHub Container Registry:
 
 ```bash
-podman pull ghcr.io/uglykitty/ws2tcp-router:0.1.4
-podman run --rm -p 22345:22345 ghcr.io/uglykitty/ws2tcp-router:0.1.4
+podman pull ghcr.io/uglykitty/ws2tcp-router:0.1.5
+podman run --rm -p 22345:22345 ghcr.io/uglykitty/ws2tcp-router:0.1.5
 ```
 
 Build the image:
@@ -55,8 +55,8 @@ Docker images and GitHub Release binaries are published by GitHub Actions when
 a version tag is pushed:
 
 ```bash
-git tag v0.1.4
-git push origin v0.1.4
+git tag v0.1.5
+git push origin v0.1.5
 ```
 
 The Release contains single-file executables:
@@ -92,6 +92,18 @@ cargo run -- --bind 10.15.108.29 --port 22345
 cargo run -- --bind 2001:db8::10 --port 22345
 ```
 
+Require HTTP Basic authentication:
+
+```bash
+cargo run -- --basic-auth alice:secret --basic-auth bob:secret2
+```
+
+Load HTTP Basic authentication credentials from a file:
+
+```bash
+cargo run -- --basic-auth-file ./users.txt
+```
+
 Then connect with a WebSocket client:
 
 ```text
@@ -105,6 +117,10 @@ ws://10.15.108.29:22345/tcp:116.63.8.64:12345
 --port <PORT>          Port to bind the WebSocket server to. Default: 22345
 --ipv6-only            Only accept IPv6 connections when binding an IPv6 address.
 --buffer-size <BYTES>  TCP read buffer size. Default: 16384
+--basic-auth <USER:PASS>
+                       Require HTTP Basic authentication. Can be repeated.
+--basic-auth-file <PATH>
+                       Load HTTP Basic authentication credentials from a file.
 ```
 
 When binding an IPv6 address without `--ipv6-only`, the listener allows dual-stack
@@ -116,6 +132,30 @@ Logging is controlled with `RUST_LOG`:
 ```bash
 RUST_LOG=ws2tcp_router=debug cargo run -- --bind :: --port 22345
 ```
+
+## HTTP Basic Authentication
+
+Authentication is disabled unless `--basic-auth` or `--basic-auth-file` is
+specified. When either option is used, every WebSocket upgrade request must
+include a matching HTTP Basic `Authorization` header.
+
+`--basic-auth` accepts one `USER:PASS` credential and can be repeated:
+
+```bash
+cargo run -- --basic-auth alice:secret --basic-auth bob:secret2
+```
+
+`--basic-auth-file` reads one `USER:PASS` credential per line. Empty lines and
+lines beginning with `#` are ignored:
+
+```text
+# users.txt
+alice:secret
+bob:secret2
+```
+
+Basic authentication does not encrypt credentials. Use it behind TLS when
+serving untrusted networks.
 
 ## Path Format
 
