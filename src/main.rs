@@ -39,7 +39,7 @@ async fn main() -> Result<()> {
 
         tokio::spawn(async move {
             if let Err(err) = handle_connection(stream, peer_addr, buffer_size, auth).await {
-                warn!(%peer_addr, error = ?err, "connection closed with error");
+                warn!(%peer_addr, error = %format_args!("{err:#}"), "connection closed with error");
             }
         });
     }
