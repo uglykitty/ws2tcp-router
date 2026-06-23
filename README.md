@@ -28,8 +28,8 @@ cargo build --release
 Published images are available from GitHub Container Registry:
 
 ```bash
-podman pull ghcr.io/uglykitty/ws2tcp-router:0.1.6
-podman run --rm -p 8000:8000 ghcr.io/uglykitty/ws2tcp-router:0.1.6
+podman pull ghcr.io/uglykitty/ws2tcp-router:0.1.7
+podman run --rm -p 8000:8000 ghcr.io/uglykitty/ws2tcp-router:0.1.7
 ```
 
 Build the image:
@@ -49,14 +49,15 @@ Pass any CLI option after the image name:
 ```bash
 docker run --rm -p 8000:8000 ws2tcp-router --bind 0.0.0.0 --port 8000
 docker run --rm -p 8000:8000 -e RUST_LOG=ws2tcp_router=debug ws2tcp-router
+docker run --rm -p 8000:8000 -v "$PWD/logs:/logs" ws2tcp-router --log-file /logs/ws2tcp-router.log
 ```
 
 Docker images and GitHub Release binaries are published by GitHub Actions when
 a version tag is pushed:
 
 ```bash
-git tag v0.1.6
-git push origin v0.1.6
+git tag v0.1.7
+git push origin v0.1.7
 ```
 
 The Release contains single-file executables:
@@ -121,6 +122,8 @@ ws://10.15.108.29:8000/tcp:116.63.8.64:12345
                        Require HTTP Basic authentication. Can be repeated.
 --basic-auth-file <PATH>
                        Load HTTP Basic authentication credentials from a file.
+--log-file <PATH>      Also append logs to this file.
+--log-level <FILTER>   Logging filter, overriding RUST_LOG. Example: ws2tcp_router=debug
 ```
 
 When binding an IPv6 address without `--ipv6-only`, the listener allows dual-stack
@@ -131,6 +134,19 @@ Logging is controlled with `RUST_LOG`:
 
 ```bash
 RUST_LOG=ws2tcp_router=debug cargo run -- --bind :: --port 8000
+```
+
+Use `--log-level` to set the same filter from the command line:
+
+```bash
+cargo run -- --bind :: --port 8000 --log-level ws2tcp_router=debug
+```
+
+By default logs are written to standard error. Use `--log-file` to also append
+logs to a file:
+
+```bash
+cargo run -- --bind :: --port 8000 --log-file ./logs/ws2tcp-router.log
 ```
 
 ## HTTP Basic Authentication
