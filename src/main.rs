@@ -36,7 +36,7 @@ struct Args {
     bind: String,
 
     /// Port to bind the WebSocket server to.
-    #[arg(long, default_value_t = 22345)]
+    #[arg(long, default_value_t = 8000)]
     port: u16,
 
     /// Only accept IPv6 connections when binding an IPv6 address.
@@ -411,7 +411,7 @@ mod tests {
     fn default_args() -> Args {
         Args {
             bind: "::".to_owned(),
-            port: 22345,
+            port: 8000,
             ipv6_only: false,
             buffer_size: 16 * 1024,
             basic_auth: Vec::new(),
