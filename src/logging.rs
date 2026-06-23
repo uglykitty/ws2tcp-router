@@ -15,8 +15,6 @@ pub fn init_logging(args: &Args) -> Result<Option<tracing_appender::non_blocking
         None => EnvFilter::try_from_default_env().unwrap_or_else(|_| "ws2tcp_router=info".into()),
     };
 
-    let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
-
     if let Some(path) = &args.log_file {
         let (file_writer, guard) = open_log_writer(path)?;
         let file_layer = tracing_subscriber::fmt::layer()
@@ -25,12 +23,13 @@ pub fn init_logging(args: &Args) -> Result<Option<tracing_appender::non_blocking
 
         tracing_subscriber::registry()
             .with(filter)
-            .with(stderr_layer)
             .with(file_layer)
             .init();
 
         Ok(Some(guard))
     } else {
+        let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
+
         tracing_subscriber::registry()
             .with(filter)
             .with(stderr_layer)

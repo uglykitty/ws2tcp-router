@@ -33,7 +33,7 @@ pub struct Args {
     #[arg(long, value_name = "PATH")]
     pub basic_auth_file: Option<PathBuf>,
 
-    /// Also append logs to this file.
+    /// Append logs to this file instead of standard error.
     #[arg(long, value_name = "PATH")]
     pub log_file: Option<PathBuf>,
 

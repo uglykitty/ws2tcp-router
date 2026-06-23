@@ -15,6 +15,9 @@ pub struct AuthConfig {
     expected_authorizations: Vec<String>,
 }
 
+const ANONYMOUS_AUTH_USER: &str = "anonymous";
+const INVALID_AUTH_USER: &str = "invalid";
+
 pub fn build_auth_config(args: &Args) -> Result<Option<AuthConfig>> {
     let auth_enabled = !args.basic_auth.is_empty() || args.basic_auth_file.is_some();
     if !auth_enabled {
@@ -79,27 +82,44 @@ pub fn authorize_request(
     request: &Request,
     auth: Option<&AuthConfig>,
     peer_addr: SocketAddr,
-) -> std::result::Result<(), ErrorResponse> {
+) -> std::result::Result<String, ErrorResponse> {
     let Some(auth) = auth else {
-        return Ok(());
+        return Ok(ANONYMOUS_AUTH_USER.to_owned());
     };
 
-    let authorized = request
+    let authorization = request
         .headers()
         .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|authorization| {
-            auth.expected_authorizations
-                .iter()
-                .any(|expected| authorization == expected)
-        });
+        .and_then(|value| value.to_str().ok());
+    let auth_user = authorization
+        .map(|authorization| {
+            basic_auth_username(authorization).unwrap_or_else(|| INVALID_AUTH_USER.to_owned())
+        })
+        .unwrap_or_else(|| ANONYMOUS_AUTH_USER.to_owned());
+    let authorized = authorization.is_some_and(|authorization| {
+        auth.expected_authorizations
+            .iter()
+            .any(|expected| authorization == expected)
+    });
 
     if authorized {
-        Ok(())
+        Ok(auth_user)
     } else {
-        warn!(%peer_addr, "rejecting websocket request with invalid basic auth");
+        warn!(%peer_addr, auth_user = %auth_user, "rejecting websocket request with invalid basic auth");
         Err(unauthorized_response())
     }
+}
+
+fn basic_auth_username(authorization: &str) -> Option<String> {
+    let encoded = authorization.strip_prefix("Basic ")?;
+    let decoded = STANDARD.decode(encoded).ok()?;
+    let credential = String::from_utf8(decoded).ok()?;
+    let (username, _) = credential.split_once(':')?;
+    if username.is_empty() {
+        return None;
+    }
+
+    Some(username.to_owned())
 }
 
 fn unauthorized_response() -> ErrorResponse {
@@ -157,6 +177,17 @@ mod tests {
     }
 
     #[test]
+    fn extracts_basic_auth_username() {
+        assert_eq!(
+            basic_auth_username("Basic YWxpY2U6c2VjcmV0"),
+            Some("alice".to_owned())
+        );
+        assert_eq!(basic_auth_username("Bearer token"), None);
+        assert_eq!(basic_auth_username("Basic not-base64"), None);
+        assert_eq!(basic_auth_username("Basic OnNlY3JldA=="), None);
+    }
+
+    #[test]
     fn disables_basic_auth_when_no_auth_options_are_set() {
         let args = default_args();
 
@@ -202,7 +233,10 @@ mod tests {
         let request = request_with_authorization(None);
         let peer_addr = "127.0.0.1:12345".parse().unwrap();
 
-        assert!(authorize_request(&request, None, peer_addr).is_ok());
+        assert_eq!(
+            authorize_request(&request, None, peer_addr).unwrap(),
+            ANONYMOUS_AUTH_USER
+        );
     }
 
     #[test]
@@ -244,6 +278,9 @@ mod tests {
         };
         let peer_addr = "127.0.0.1:12345".parse().unwrap();
 
-        assert!(authorize_request(&request, Some(&auth), peer_addr).is_ok());
+        assert_eq!(
+            authorize_request(&request, Some(&auth), peer_addr).unwrap(),
+            "bob"
+        );
     }
 }

@@ -31,11 +31,14 @@ pub async fn handle_connection(
 ) -> Result<()> {
     let requested_target = Arc::new(Mutex::new(None));
     let target_slot = Arc::clone(&requested_target);
+    let authenticated_user = Arc::new(Mutex::new(None));
+    let auth_user_slot = Arc::clone(&authenticated_user);
 
     #[allow(clippy::result_large_err)]
     let websocket = accept_hdr_async(stream, move |request: &Request, response: Response| {
-        authorize_request(request, auth.as_deref(), peer_addr)?;
-        capture_requested_target(request, response, &target_slot, peer_addr)
+        let auth_user = authorize_request(request, auth.as_deref(), peer_addr)?;
+        *auth_user_slot.lock().expect("auth user mutex poisoned") = Some(auth_user.clone());
+        capture_requested_target(request, response, &target_slot, peer_addr, &auth_user)
     })
     .await
     .context("websocket handshake failed")?;
@@ -45,8 +48,13 @@ pub async fn handle_connection(
         .expect("target mutex poisoned")
         .clone()
         .ok_or_else(|| anyhow!("websocket request target was not captured"))?;
+    let auth_user = authenticated_user
+        .lock()
+        .expect("auth user mutex poisoned")
+        .clone()
+        .ok_or_else(|| anyhow!("websocket auth user was not captured"))?;
 
-    info!(%peer_addr, upstream = %target.addr(), "proxying websocket to tcp");
+    info!(%peer_addr, auth_user = %auth_user, upstream = %target.addr(), "proxying websocket to tcp");
 
     let tcp = TcpStream::connect(target.addr())
         .await
@@ -61,6 +69,7 @@ fn capture_requested_target(
     response: Response,
     target_slot: &Arc<Mutex<Option<Target>>>,
     peer_addr: SocketAddr,
+    auth_user: &str,
 ) -> std::result::Result<Response, ErrorResponse> {
     match parse_target(request.uri().path()) {
         Ok(target) => {
@@ -70,6 +79,7 @@ fn capture_requested_target(
         Err(err) => {
             warn!(
                 %peer_addr,
+                auth_user = %auth_user,
                 path = %request.uri().path(),
                 error = %err,
                 "rejecting websocket request"
