@@ -1,17 +1,20 @@
 use std::{fs, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
-use clap::{ArgAction, Parser};
+use clap::{ArgAction, Parser, ValueEnum};
 use serde::Deserialize;
 
 const DEFAULT_BIND: &str = "::";
-const DEFAULT_PORT: u16 = 8000;
+const DEFAULT_PORT: u16 = 80;
+const DEFAULT_TLS_PORT: u16 = 443;
 const DEFAULT_BUFFER_SIZE: usize = 16 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct Args {
     pub bind: String,
+    pub service_mode: ServiceMode,
     pub port: u16,
+    pub tls_port: u16,
     pub ipv6_only: bool,
     pub buffer_size: usize,
     pub basic_auth: Vec<String>,
@@ -71,12 +74,18 @@ impl Args {
             )
         };
 
+        let service_mode = cli.service_mode.or(config.service_mode).unwrap_or_default();
+        let port = cli.port.or(config.port).unwrap_or(DEFAULT_PORT);
+        let tls_port = cli.tls_port.or(config.tls_port).unwrap_or(DEFAULT_TLS_PORT);
+
         let args = Self {
             bind: cli
                 .bind
                 .or(config.bind)
                 .unwrap_or_else(|| DEFAULT_BIND.to_owned()),
-            port: cli.port.or(config.port).unwrap_or(DEFAULT_PORT),
+            service_mode,
+            port,
+            tls_port,
             ipv6_only: if cli.ipv6_only {
                 true
             } else if cli.no_ipv6_only {
@@ -118,7 +127,38 @@ impl Args {
             bail!("--auto-self-signed-cert cannot be used with --tls-cert or --tls-key");
         }
 
+        if self.service_mode.includes_wss() && !self.has_tls_config() {
+            bail!("wss service mode requires --tls-cert and --tls-key, or --auto-self-signed-cert");
+        }
+
+        if self.service_mode == ServiceMode::Both && self.port == self.tls_port {
+            bail!("--port and --tls-port must be different when --service-mode both is used");
+        }
+
         Ok(())
+    }
+
+    pub fn has_tls_config(&self) -> bool {
+        self.auto_self_signed_cert || (self.tls_cert.is_some() && self.tls_key.is_some())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum ServiceMode {
+    #[default]
+    WsOnly,
+    WssOnly,
+    Both,
+}
+
+impl ServiceMode {
+    pub fn includes_ws(self) -> bool {
+        matches!(self, Self::WsOnly | Self::Both)
+    }
+
+    pub fn includes_wss(self) -> bool {
+        matches!(self, Self::WssOnly | Self::Both)
     }
 }
 
@@ -137,9 +177,17 @@ struct CliArgs {
     #[arg(long)]
     bind: Option<String>,
 
-    /// Port to bind the WebSocket server to.
+    /// Service mode to run.
+    #[arg(long, value_enum)]
+    service_mode: Option<ServiceMode>,
+
+    /// Port to bind the WS server to.
     #[arg(long)]
     port: Option<u16>,
+
+    /// Port to bind the WSS server to.
+    #[arg(long)]
+    tls_port: Option<u16>,
 
     /// Only accept IPv6 connections when binding an IPv6 address.
     #[arg(long, action = ArgAction::SetTrue, conflicts_with = "no_ipv6_only")]
@@ -193,7 +241,9 @@ struct CliArgs {
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 struct ConfigArgs {
     bind: Option<String>,
+    service_mode: Option<ServiceMode>,
     port: Option<u16>,
+    tls_port: Option<u16>,
     ipv6_only: Option<bool>,
     buffer_size: Option<usize>,
     basic_auth: Option<Vec<String>>,
@@ -242,7 +292,9 @@ mod tests {
         let args = parse(&[]);
 
         assert_eq!(args.bind, DEFAULT_BIND);
+        assert_eq!(args.service_mode, ServiceMode::WsOnly);
         assert_eq!(args.port, DEFAULT_PORT);
+        assert_eq!(args.tls_port, DEFAULT_TLS_PORT);
         assert!(!args.ipv6_only);
         assert_eq!(args.buffer_size, DEFAULT_BUFFER_SIZE);
         assert!(args.basic_auth.is_empty());
@@ -258,7 +310,9 @@ mod tests {
             &path,
             r#"
 bind = "127.0.0.1"
-port = 8443
+service-mode = "wss-only"
+port = 8080
+tls-port = 8443
 ipv6-only = true
 buffer-size = 4096
 basic-auth = ["alice:secret"]
@@ -276,7 +330,9 @@ log-level = "ws2tcp_router=debug"
         fs::remove_file(path).unwrap();
 
         assert_eq!(args.bind, "127.0.0.1");
-        assert_eq!(args.port, 8443);
+        assert_eq!(args.service_mode, ServiceMode::WssOnly);
+        assert_eq!(args.port, 8080);
+        assert_eq!(args.tls_port, 8443);
         assert!(args.ipv6_only);
         assert_eq!(args.buffer_size, 4096);
         assert_eq!(args.basic_auth, vec!["alice:secret"]);
@@ -296,6 +352,7 @@ log-level = "ws2tcp_router=debug"
             r#"
 bind = "127.0.0.1"
 port = 8001
+service-mode = "ws-only"
 ipv6-only = true
 buffer-size = 4096
 basic-auth = ["alice:secret"]
@@ -310,8 +367,12 @@ tls-key = "./config-key.pem"
             path.to_str().unwrap(),
             "--bind",
             "0.0.0.0",
+            "--service-mode",
+            "wss-only",
             "--port",
             "9000",
+            "--tls-port",
+            "9443",
             "--no-ipv6-only",
             "--buffer-size",
             "8192",
@@ -325,7 +386,9 @@ tls-key = "./config-key.pem"
         fs::remove_file(path).unwrap();
 
         assert_eq!(args.bind, "0.0.0.0");
+        assert_eq!(args.service_mode, ServiceMode::WssOnly);
         assert_eq!(args.port, 9000);
+        assert_eq!(args.tls_port, 9443);
         assert!(!args.ipv6_only);
         assert_eq!(args.buffer_size, 8192);
         assert_eq!(args.basic_auth, vec!["bob:secret"]);
@@ -431,5 +494,50 @@ tls-key = "./config-key.pem"
         assert!(!args.auto_self_signed_cert);
         assert!(args.tls_cert.is_none());
         assert!(args.tls_key.is_none());
+    }
+
+    #[test]
+    fn port_sets_ws_port() {
+        let args = parse(&["--port", "8080"]);
+
+        assert_eq!(args.port, 8080);
+        assert_eq!(args.tls_port, DEFAULT_TLS_PORT);
+    }
+
+    #[test]
+    fn rejects_wss_mode_without_tls_config() {
+        let args = std::iter::once("ws2tcp-router")
+            .chain(["--service-mode", "wss-only"])
+            .map(OsString::from);
+        let result = Args::try_parse_from(args);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn accepts_both_mode_with_auto_self_signed_cert() {
+        let args = parse(&["--service-mode", "both", "--auto-self-signed-cert"]);
+
+        assert_eq!(args.service_mode, ServiceMode::Both);
+        assert_eq!(args.port, DEFAULT_PORT);
+        assert_eq!(args.tls_port, DEFAULT_TLS_PORT);
+    }
+
+    #[test]
+    fn rejects_both_mode_with_same_ports() {
+        let args = std::iter::once("ws2tcp-router")
+            .chain([
+                "--service-mode",
+                "both",
+                "--auto-self-signed-cert",
+                "--port",
+                "8443",
+                "--tls-port",
+                "8443",
+            ])
+            .map(OsString::from);
+        let result = Args::try_parse_from(args);
+
+        assert!(result.is_err());
     }
 }

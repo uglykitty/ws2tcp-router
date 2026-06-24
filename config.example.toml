@@ -2,7 +2,9 @@
 # CLI arguments override values from this file.
 
 bind = "::"
-port = 8000
+service-mode = "ws-only"
+port = 80
+tls-port = 443
 ipv6-only = false
 buffer-size = 16384
 

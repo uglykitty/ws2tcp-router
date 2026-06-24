@@ -157,7 +157,9 @@ mod tests {
     fn default_args() -> Args {
         Args {
             bind: "::".to_owned(),
-            port: 8000,
+            service_mode: crate::args::ServiceMode::WsOnly,
+            port: 80,
+            tls_port: 443,
             ipv6_only: false,
             buffer_size: 16 * 1024,
             basic_auth: Vec::new(),

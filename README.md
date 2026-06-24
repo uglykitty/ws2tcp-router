@@ -38,10 +38,10 @@ Build the image:
 docker build -t ws2tcp-router .
 ```
 
-Run with the default listener on port `8000`:
+Run with the default WS listener on port `80`:
 
 ```bash
-docker run --rm -p 8000:8000 ws2tcp-router
+docker run --rm -p 80:80 ws2tcp-router
 ```
 
 Pass any CLI option after the image name:
@@ -74,7 +74,13 @@ image should be pullable without authentication.
 
 ## Run
 
-Bind on all interfaces and port `8000`:
+Bind on all interfaces and the default WS port `80`:
+
+```bash
+cargo run -- --bind ::
+```
+
+Bind on a non-privileged WS port:
 
 ```bash
 cargo run -- --bind :: --port 8000
@@ -126,13 +132,13 @@ ws://10.15.108.29:8000/tcp:116.63.8.64:12345
 Serve WSS with a PEM certificate chain and private key:
 
 ```bash
-cargo run -- --bind 0.0.0.0 --port 8443 --tls-cert ./cert.pem --tls-key ./key.pem
+cargo run -- --bind 0.0.0.0 --service-mode wss-only --tls-port 443 --tls-cert ./cert.pem --tls-key ./key.pem
 ```
 
 Then connect with a secure WebSocket client:
 
 ```text
-wss://10.15.108.29:8443/tcp:116.63.8.64:12345
+wss://10.15.108.29/tcp:116.63.8.64:12345
 ```
 
 ## Options
@@ -140,7 +146,9 @@ wss://10.15.108.29:8443/tcp:116.63.8.64:12345
 ```text
 --config <PATH>       Load options from a TOML configuration file.
 --bind <ADDR>          Address to bind the WebSocket server to. Default: ::
---port <PORT>          Port to bind the WebSocket server to. Default: 8000
+--service-mode <MODE>  Service mode to run: ws-only, wss-only, or both. Default: ws-only
+--port <PORT>          Port to bind the WS server to. Default: 80
+--tls-port <PORT>      Port to bind the WSS server to. Default: 443
 --ipv6-only            Only accept IPv6 connections when binding an IPv6 address.
 --no-ipv6-only         Accept both IPv4 and IPv6 when binding an IPv6 address.
 --buffer-size <BYTES>  TCP read buffer size. Default: 16384
@@ -170,7 +178,9 @@ uses the same kebab-case names as the long command-line options:
 
 ```toml
 bind = "::"
-port = 8000
+service-mode = "ws-only"
+port = 80
+tls-port = 443
 ipv6-only = false
 buffer-size = 16384
 
@@ -236,7 +246,7 @@ TLS is disabled by default. Configure both `--tls-cert` and `--tls-key` to serve
 secure WebSocket connections with `wss://`:
 
 ```bash
-cargo run -- --port 8443 --tls-cert ./cert.pem --tls-key ./key.pem
+cargo run -- --service-mode wss-only --tls-cert ./cert.pem --tls-key ./key.pem
 ```
 
 `--tls-cert` must point to a PEM certificate chain, and `--tls-key` must point to
@@ -250,7 +260,13 @@ list includes the server's current IPv4 and IPv6 addresses. This option cannot
 be used together with `--tls-cert` or `--tls-key`:
 
 ```bash
-cargo run -- --port 8443 --auto-self-signed-cert
+cargo run -- --service-mode wss-only --auto-self-signed-cert
+```
+
+Run both WS and WSS listeners at the same time:
+
+```bash
+cargo run -- --service-mode both --port 80 --tls-port 443 --auto-self-signed-cert
 ```
 
 ## Path Format
