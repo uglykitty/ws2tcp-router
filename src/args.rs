@@ -1,6 +1,103 @@
-use std::path::PathBuf;
+use std::{fs, path::PathBuf};
 
-use clap::Parser;
+use anyhow::{Context, Result, bail};
+use clap::{ArgAction, Parser};
+use serde::Deserialize;
+
+const DEFAULT_BIND: &str = "::";
+const DEFAULT_PORT: u16 = 8000;
+const DEFAULT_BUFFER_SIZE: usize = 16 * 1024;
+
+#[derive(Debug, Clone)]
+pub struct Args {
+    pub bind: String,
+    pub port: u16,
+    pub ipv6_only: bool,
+    pub buffer_size: usize,
+    pub basic_auth: Vec<String>,
+    pub basic_auth_file: Option<PathBuf>,
+    pub tls_cert: Option<PathBuf>,
+    pub tls_key: Option<PathBuf>,
+    pub log_file: Option<PathBuf>,
+    pub log_level: Option<String>,
+}
+
+impl Args {
+    pub fn parse() -> Result<Self> {
+        Self::try_parse_from(std::env::args_os())
+    }
+
+    #[cfg(test)]
+    fn try_parse_from<I, T>(args: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let cli = CliArgs::try_parse_from(args)?;
+        Self::from_cli(cli)
+    }
+
+    #[cfg(not(test))]
+    fn try_parse_from<I, T>(args: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let cli = CliArgs::parse_from(args);
+        Self::from_cli(cli)
+    }
+
+    fn from_cli(cli: CliArgs) -> Result<Self> {
+        let config = match &cli.config {
+            Some(path) => ConfigArgs::read(path)?,
+            None => ConfigArgs::default(),
+        };
+
+        let args = Self {
+            bind: cli
+                .bind
+                .or(config.bind)
+                .unwrap_or_else(|| DEFAULT_BIND.to_owned()),
+            port: cli.port.or(config.port).unwrap_or(DEFAULT_PORT),
+            ipv6_only: if cli.ipv6_only {
+                true
+            } else if cli.no_ipv6_only {
+                false
+            } else {
+                config.ipv6_only.unwrap_or(false)
+            },
+            buffer_size: cli
+                .buffer_size
+                .or(config.buffer_size)
+                .unwrap_or(DEFAULT_BUFFER_SIZE),
+            basic_auth: if cli.basic_auth.is_empty() {
+                config.basic_auth.unwrap_or_default()
+            } else {
+                cli.basic_auth
+            },
+            basic_auth_file: cli.basic_auth_file.or(config.basic_auth_file),
+            tls_cert: cli.tls_cert.or(config.tls_cert),
+            tls_key: cli.tls_key.or(config.tls_key),
+            log_file: cli.log_file.or(config.log_file),
+            log_level: cli.log_level.or(config.log_level),
+        };
+
+        args.validate()?;
+        Ok(args)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.buffer_size == 0 {
+            bail!("--buffer-size must be greater than 0");
+        }
+
+        if self.tls_cert.is_some() != self.tls_key.is_some() {
+            bail!("--tls-cert and --tls-key must be configured together");
+        }
+
+        Ok(())
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -8,44 +105,207 @@ use clap::Parser;
     version,
     about = "Forward WebSocket connections to TCP upstreams"
 )]
-pub struct Args {
+struct CliArgs {
+    /// Load options from a TOML configuration file.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+
     /// Address to bind the WebSocket server to.
-    #[arg(long, default_value = "::")]
-    pub bind: String,
+    #[arg(long)]
+    bind: Option<String>,
 
     /// Port to bind the WebSocket server to.
-    #[arg(long, default_value_t = 8000)]
-    pub port: u16,
+    #[arg(long)]
+    port: Option<u16>,
 
     /// Only accept IPv6 connections when binding an IPv6 address.
-    #[arg(long)]
-    pub ipv6_only: bool,
+    #[arg(long, action = ArgAction::SetTrue, conflicts_with = "no_ipv6_only")]
+    ipv6_only: bool,
+
+    /// Accept both IPv4 and IPv6 connections when binding an IPv6 address.
+    #[arg(long, action = ArgAction::SetTrue, conflicts_with = "ipv6_only")]
+    no_ipv6_only: bool,
 
     /// Maximum TCP read buffer size in bytes.
-    #[arg(long, default_value_t = 16 * 1024)]
-    pub buffer_size: usize,
+    #[arg(long)]
+    buffer_size: Option<usize>,
 
     /// Require HTTP Basic authentication for WebSocket handshakes. Can be repeated.
     #[arg(long, value_name = "USER:PASS")]
-    pub basic_auth: Vec<String>,
+    basic_auth: Vec<String>,
 
     /// Load HTTP Basic authentication credentials from a line-based USER:PASS file.
     #[arg(long, value_name = "PATH")]
-    pub basic_auth_file: Option<PathBuf>,
+    basic_auth_file: Option<PathBuf>,
 
     /// PEM-encoded TLS certificate chain for serving WSS.
-    #[arg(long, value_name = "PATH", requires = "tls_key")]
-    pub tls_cert: Option<PathBuf>,
+    #[arg(long, value_name = "PATH")]
+    tls_cert: Option<PathBuf>,
 
     /// PEM-encoded TLS private key for serving WSS.
-    #[arg(long, value_name = "PATH", requires = "tls_cert")]
-    pub tls_key: Option<PathBuf>,
+    #[arg(long, value_name = "PATH")]
+    tls_key: Option<PathBuf>,
 
     /// Append logs to this file instead of standard error.
     #[arg(long, value_name = "PATH")]
-    pub log_file: Option<PathBuf>,
+    log_file: Option<PathBuf>,
 
     /// Logging filter, overriding RUST_LOG. Example: ws2tcp_router=debug
     #[arg(long, value_name = "FILTER")]
-    pub log_level: Option<String>,
+    log_level: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+struct ConfigArgs {
+    bind: Option<String>,
+    port: Option<u16>,
+    ipv6_only: Option<bool>,
+    buffer_size: Option<usize>,
+    basic_auth: Option<Vec<String>>,
+    basic_auth_file: Option<PathBuf>,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
+    log_file: Option<PathBuf>,
+    log_level: Option<String>,
+}
+
+impl ConfigArgs {
+    fn read(path: &PathBuf) -> Result<Self> {
+        let contents = fs::read_to_string(path)
+            .with_context(|| format!("failed to read config file {}", path.display()))?;
+        toml::from_str(&contents)
+            .with_context(|| format!("failed to parse config file {}", path.display()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+
+    use super::*;
+
+    fn parse(args: &[&str]) -> Args {
+        let args = std::iter::once("ws2tcp-router")
+            .chain(args.iter().copied())
+            .map(OsString::from);
+        Args::try_parse_from(args).unwrap()
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "ws2tcp-router-{name}-{}-{}.toml",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        path
+    }
+
+    #[test]
+    fn uses_defaults_without_config_or_cli_values() {
+        let args = parse(&[]);
+
+        assert_eq!(args.bind, DEFAULT_BIND);
+        assert_eq!(args.port, DEFAULT_PORT);
+        assert!(!args.ipv6_only);
+        assert_eq!(args.buffer_size, DEFAULT_BUFFER_SIZE);
+        assert!(args.basic_auth.is_empty());
+        assert!(args.tls_cert.is_none());
+        assert!(args.tls_key.is_none());
+    }
+
+    #[test]
+    fn reads_values_from_config_file() {
+        let path = temp_path("config");
+        fs::write(
+            &path,
+            r#"
+bind = "127.0.0.1"
+port = 8443
+ipv6-only = true
+buffer-size = 4096
+basic-auth = ["alice:secret"]
+basic-auth-file = "./users.txt"
+tls-cert = "./cert.pem"
+tls-key = "./key.pem"
+log-file = "./router.log"
+log-level = "ws2tcp_router=debug"
+"#,
+        )
+        .unwrap();
+
+        let args = parse(&["--config", path.to_str().unwrap()]);
+        fs::remove_file(path).unwrap();
+
+        assert_eq!(args.bind, "127.0.0.1");
+        assert_eq!(args.port, 8443);
+        assert!(args.ipv6_only);
+        assert_eq!(args.buffer_size, 4096);
+        assert_eq!(args.basic_auth, vec!["alice:secret"]);
+        assert_eq!(args.basic_auth_file, Some(PathBuf::from("./users.txt")));
+        assert_eq!(args.tls_cert, Some(PathBuf::from("./cert.pem")));
+        assert_eq!(args.tls_key, Some(PathBuf::from("./key.pem")));
+        assert_eq!(args.log_file, Some(PathBuf::from("./router.log")));
+        assert_eq!(args.log_level, Some("ws2tcp_router=debug".to_owned()));
+    }
+
+    #[test]
+    fn cli_values_override_config_file_values() {
+        let path = temp_path("override");
+        fs::write(
+            &path,
+            r#"
+bind = "127.0.0.1"
+port = 8001
+ipv6-only = true
+buffer-size = 4096
+basic-auth = ["alice:secret"]
+tls-cert = "./config-cert.pem"
+tls-key = "./config-key.pem"
+"#,
+        )
+        .unwrap();
+
+        let args = parse(&[
+            "--config",
+            path.to_str().unwrap(),
+            "--bind",
+            "0.0.0.0",
+            "--port",
+            "9000",
+            "--no-ipv6-only",
+            "--buffer-size",
+            "8192",
+            "--basic-auth",
+            "bob:secret",
+            "--tls-cert",
+            "./cli-cert.pem",
+            "--tls-key",
+            "./cli-key.pem",
+        ]);
+        fs::remove_file(path).unwrap();
+
+        assert_eq!(args.bind, "0.0.0.0");
+        assert_eq!(args.port, 9000);
+        assert!(!args.ipv6_only);
+        assert_eq!(args.buffer_size, 8192);
+        assert_eq!(args.basic_auth, vec!["bob:secret"]);
+        assert_eq!(args.tls_cert, Some(PathBuf::from("./cli-cert.pem")));
+        assert_eq!(args.tls_key, Some(PathBuf::from("./cli-key.pem")));
+    }
+
+    #[test]
+    fn rejects_partial_tls_config_after_merge() {
+        let path = temp_path("partial-tls");
+        fs::write(&path, r#"tls-cert = "./cert.pem""#).unwrap();
+
+        let args = std::iter::once("ws2tcp-router")
+            .chain(["--config", path.to_str().unwrap()])
+            .map(OsString::from);
+        let result = Args::try_parse_from(args);
+        fs::remove_file(path).unwrap();
+
+        assert!(result.is_err());
+    }
 }

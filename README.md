@@ -80,6 +80,18 @@ Bind on all interfaces and port `8000`:
 cargo run -- --bind :: --port 8000
 ```
 
+Load options from a TOML configuration file:
+
+```bash
+cargo run -- --config ./config.example.toml
+```
+
+Command-line options override values from the configuration file:
+
+```bash
+cargo run -- --config ./config.example.toml --bind 0.0.0.0 --port 9000
+```
+
 Bind on IPv6 only:
 
 ```bash
@@ -126,9 +138,11 @@ wss://10.15.108.29:8443/tcp:116.63.8.64:12345
 ## Options
 
 ```text
+--config <PATH>       Load options from a TOML configuration file.
 --bind <ADDR>          Address to bind the WebSocket server to. Default: ::
 --port <PORT>          Port to bind the WebSocket server to. Default: 8000
 --ipv6-only            Only accept IPv6 connections when binding an IPv6 address.
+--no-ipv6-only         Accept both IPv4 and IPv6 when binding an IPv6 address.
 --buffer-size <BYTES>  TCP read buffer size. Default: 16384
 --basic-auth <USER:PASS>
                        Require HTTP Basic authentication. Can be repeated.
@@ -142,7 +156,31 @@ wss://10.15.108.29:8443/tcp:116.63.8.64:12345
 
 When binding an IPv6 address without `--ipv6-only`, the listener allows dual-stack
 operation where the operating system supports it. Use `--ipv6-only` to reject
-IPv4-mapped connections.
+IPv4-mapped connections. If a configuration file sets `ipv6-only = true`, use
+`--no-ipv6-only` to override it from the command line.
+
+## Configuration File
+
+Use `--config <PATH>` to load options from a TOML configuration file. The file
+uses the same kebab-case names as the long command-line options:
+
+```toml
+bind = "::"
+port = 8000
+ipv6-only = false
+buffer-size = 16384
+
+basic-auth = ["alice:secret", "bob:secret2"]
+basic-auth-file = "./users.txt"
+tls-cert = "./cert.pem"
+tls-key = "./key.pem"
+log-file = "./logs/ws2tcp-router.log"
+log-level = "ws2tcp_router=info"
+```
+
+Every setting is optional. Missing settings use the same defaults as the CLI.
+When both `--config` and command-line options are present, command-line options
+take precedence. See `config.example.toml` for a complete commented example.
 
 Logging is controlled with `RUST_LOG`:
 

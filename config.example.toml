@@ -1,0 +1,18 @@
+# ws2tcp-router configuration example.
+# CLI arguments override values from this file.
+
+bind = "::"
+port = 8000
+ipv6-only = false
+buffer-size = 16384
+
+# HTTP Basic authentication is disabled when both options are omitted.
+# basic-auth = ["alice:secret", "bob:secret2"]
+# basic-auth-file = "./users.txt"
+
+# Configure both TLS fields to serve WSS.
+# tls-cert = "./cert.pem"
+# tls-key = "./key.pem"
+
+# log-file = "./logs/ws2tcp-router.log"
+# log-level = "ws2tcp_router=info"

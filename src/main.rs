@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
-use clap::Parser;
+use anyhow::{Context, Result};
 use tracing::{info, warn};
 
 mod args;
@@ -22,12 +21,8 @@ use tokio_rustls::TlsAcceptor;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    let args = Args::parse()?;
     let _log_guard = init_logging(&args)?;
-
-    if args.buffer_size == 0 {
-        bail!("--buffer-size must be greater than 0");
-    }
 
     let auth = build_auth_config(&args)?.map(Arc::new);
     let tls_config = build_tls_config(&args)?;
