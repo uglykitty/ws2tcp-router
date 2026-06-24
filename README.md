@@ -150,6 +150,10 @@ wss://10.15.108.29:8443/tcp:116.63.8.64:12345
                        Load HTTP Basic authentication credentials from a file.
 --tls-cert <PATH>      PEM-encoded TLS certificate chain for serving WSS.
 --tls-key <PATH>       PEM-encoded TLS private key for serving WSS.
+--auto-self-signed-cert
+                       Generate an in-memory 10-year self-signed certificate for WSS.
+--no-auto-self-signed-cert
+                       Disable automatic self-signed certificate generation from a config file.
 --log-file <PATH>      Append logs to this file instead of standard error.
 --log-level <FILTER>   Logging filter, overriding RUST_LOG. Example: ws2tcp_router=debug
 ```
@@ -174,6 +178,7 @@ basic-auth = ["alice:secret", "bob:secret2"]
 basic-auth-file = "./users.txt"
 tls-cert = "./cert.pem"
 tls-key = "./key.pem"
+auto-self-signed-cert = false
 log-file = "./logs/ws2tcp-router.log"
 log-level = "ws2tcp_router=info"
 ```
@@ -238,6 +243,15 @@ cargo run -- --port 8443 --tls-cert ./cert.pem --tls-key ./key.pem
 a PEM private key. Configure clients to trust the certificate authority that
 issued the certificate, or use a publicly trusted certificate for public
 deployments.
+
+For local or controlled deployments, `--auto-self-signed-cert` generates an
+in-memory self-signed certificate that is valid for 10 years. The certificate SAN
+list includes the server's current IPv4 and IPv6 addresses. This option cannot
+be used together with `--tls-cert` or `--tls-key`:
+
+```bash
+cargo run -- --port 8443 --auto-self-signed-cert
+```
 
 ## Path Format
 

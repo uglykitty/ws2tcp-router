@@ -14,5 +14,8 @@ buffer-size = 16384
 # tls-cert = "./cert.pem"
 # tls-key = "./key.pem"
 
+# Or generate an in-memory 10-year self-signed certificate for WSS.
+# auto-self-signed-cert = true
+
 # log-file = "./logs/ws2tcp-router.log"
 # log-level = "ws2tcp_router=info"

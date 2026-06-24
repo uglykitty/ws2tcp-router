@@ -164,6 +164,7 @@ mod tests {
             basic_auth_file: None,
             tls_cert: None,
             tls_key: None,
+            auto_self_signed_cert: false,
             log_file: None,
             log_level: None,
         }

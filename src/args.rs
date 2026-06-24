@@ -18,6 +18,7 @@ pub struct Args {
     pub basic_auth_file: Option<PathBuf>,
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
+    pub auto_self_signed_cert: bool,
     pub log_file: Option<PathBuf>,
     pub log_level: Option<String>,
 }
@@ -53,6 +54,23 @@ impl Args {
             None => ConfigArgs::default(),
         };
 
+        let cli_file_tls = cli.tls_cert.is_some() || cli.tls_key.is_some();
+        let (tls_cert, tls_key, auto_self_signed_cert) = if cli.auto_self_signed_cert {
+            (None, None, true)
+        } else if cli.no_auto_self_signed_cert || cli_file_tls {
+            (
+                cli.tls_cert.or(config.tls_cert),
+                cli.tls_key.or(config.tls_key),
+                false,
+            )
+        } else {
+            (
+                config.tls_cert,
+                config.tls_key,
+                config.auto_self_signed_cert.unwrap_or(false),
+            )
+        };
+
         let args = Self {
             bind: cli
                 .bind
@@ -76,8 +94,9 @@ impl Args {
                 cli.basic_auth
             },
             basic_auth_file: cli.basic_auth_file.or(config.basic_auth_file),
-            tls_cert: cli.tls_cert.or(config.tls_cert),
-            tls_key: cli.tls_key.or(config.tls_key),
+            tls_cert,
+            tls_key,
+            auto_self_signed_cert,
             log_file: cli.log_file.or(config.log_file),
             log_level: cli.log_level.or(config.log_level),
         };
@@ -93,6 +112,10 @@ impl Args {
 
         if self.tls_cert.is_some() != self.tls_key.is_some() {
             bail!("--tls-cert and --tls-key must be configured together");
+        }
+
+        if self.auto_self_signed_cert && self.tls_cert.is_some() {
+            bail!("--auto-self-signed-cert cannot be used with --tls-cert or --tls-key");
         }
 
         Ok(())
@@ -146,6 +169,17 @@ struct CliArgs {
     #[arg(long, value_name = "PATH")]
     tls_key: Option<PathBuf>,
 
+    /// Generate an in-memory 10-year self-signed certificate for serving WSS.
+    #[arg(
+        long,
+        conflicts_with_all = ["no_auto_self_signed_cert", "tls_cert", "tls_key"]
+    )]
+    auto_self_signed_cert: bool,
+
+    /// Disable automatic self-signed certificate generation from a config file.
+    #[arg(long, conflicts_with = "auto_self_signed_cert")]
+    no_auto_self_signed_cert: bool,
+
     /// Append logs to this file instead of standard error.
     #[arg(long, value_name = "PATH")]
     log_file: Option<PathBuf>,
@@ -166,6 +200,7 @@ struct ConfigArgs {
     basic_auth_file: Option<PathBuf>,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
+    auto_self_signed_cert: Option<bool>,
     log_file: Option<PathBuf>,
     log_level: Option<String>,
 }
@@ -213,6 +248,7 @@ mod tests {
         assert!(args.basic_auth.is_empty());
         assert!(args.tls_cert.is_none());
         assert!(args.tls_key.is_none());
+        assert!(!args.auto_self_signed_cert);
     }
 
     #[test]
@@ -229,6 +265,7 @@ basic-auth = ["alice:secret"]
 basic-auth-file = "./users.txt"
 tls-cert = "./cert.pem"
 tls-key = "./key.pem"
+auto-self-signed-cert = false
 log-file = "./router.log"
 log-level = "ws2tcp_router=debug"
 "#,
@@ -246,6 +283,7 @@ log-level = "ws2tcp_router=debug"
         assert_eq!(args.basic_auth_file, Some(PathBuf::from("./users.txt")));
         assert_eq!(args.tls_cert, Some(PathBuf::from("./cert.pem")));
         assert_eq!(args.tls_key, Some(PathBuf::from("./key.pem")));
+        assert!(!args.auto_self_signed_cert);
         assert_eq!(args.log_file, Some(PathBuf::from("./router.log")));
         assert_eq!(args.log_level, Some("ws2tcp_router=debug".to_owned()));
     }
@@ -307,5 +345,91 @@ tls-key = "./config-key.pem"
         fs::remove_file(path).unwrap();
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn enables_auto_self_signed_cert_from_cli() {
+        let args = parse(&["--auto-self-signed-cert"]);
+
+        assert!(args.auto_self_signed_cert);
+        assert!(args.tls_cert.is_none());
+        assert!(args.tls_key.is_none());
+    }
+
+    #[test]
+    fn rejects_auto_self_signed_cert_with_file_tls() {
+        let args = std::iter::once("ws2tcp-router")
+            .chain([
+                "--auto-self-signed-cert",
+                "--tls-cert",
+                "./cert.pem",
+                "--tls-key",
+                "./key.pem",
+            ])
+            .map(OsString::from);
+        let result = Args::try_parse_from(args);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_auto_self_signed_cert_overrides_config_file_tls() {
+        let path = temp_path("auto-overrides-file-tls");
+        fs::write(
+            &path,
+            r#"
+tls-cert = "./config-cert.pem"
+tls-key = "./config-key.pem"
+"#,
+        )
+        .unwrap();
+
+        let args = parse(&[
+            "--config",
+            path.to_str().unwrap(),
+            "--auto-self-signed-cert",
+        ]);
+        fs::remove_file(path).unwrap();
+
+        assert!(args.auto_self_signed_cert);
+        assert!(args.tls_cert.is_none());
+        assert!(args.tls_key.is_none());
+    }
+
+    #[test]
+    fn cli_file_tls_overrides_config_auto_self_signed_cert() {
+        let path = temp_path("file-tls-overrides-auto");
+        fs::write(&path, r#"auto-self-signed-cert = true"#).unwrap();
+
+        let args = parse(&[
+            "--config",
+            path.to_str().unwrap(),
+            "--tls-cert",
+            "./cli-cert.pem",
+            "--tls-key",
+            "./cli-key.pem",
+        ]);
+        fs::remove_file(path).unwrap();
+
+        assert!(!args.auto_self_signed_cert);
+        assert_eq!(args.tls_cert, Some(PathBuf::from("./cli-cert.pem")));
+        assert_eq!(args.tls_key, Some(PathBuf::from("./cli-key.pem")));
+    }
+
+    #[test]
+    fn cli_no_auto_self_signed_cert_overrides_config_auto_self_signed_cert() {
+        let path = temp_path("no-auto");
+        fs::write(&path, r#"auto-self-signed-cert = true"#).unwrap();
+
+        let args = parse(&[
+            "--config",
+            path.to_str().unwrap(),
+            "--no-auto-self-signed-cert",
+        ]);
+        fs::remove_file(path).unwrap();
+
+        assert!(!args.auto_self_signed_cert);
+        assert!(args.tls_cert.is_none());
+        assert!(args.tls_key.is_none());
     }
 }
