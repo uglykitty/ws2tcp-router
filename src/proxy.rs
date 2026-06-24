@@ -6,11 +6,11 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
 };
 use tokio_tungstenite::{
-    accept_hdr_async,
+    WebSocketStream, accept_hdr_async,
     tungstenite::{
         Message,
         handshake::server::{ErrorResponse, Request, Response},
@@ -23,12 +23,15 @@ use crate::{
     target::{Target, parse_target},
 };
 
-pub async fn handle_connection(
-    stream: TcpStream,
+pub async fn handle_connection<S>(
+    stream: S,
     peer_addr: SocketAddr,
     buffer_size: usize,
     auth: Option<Arc<AuthConfig>>,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let requested_target = Arc::new(Mutex::new(None));
     let target_slot = Arc::clone(&requested_target);
     let authenticated_user = Arc::new(Mutex::new(None));
@@ -92,11 +95,10 @@ fn capture_requested_target(
     }
 }
 
-async fn proxy(
-    websocket: tokio_tungstenite::WebSocketStream<TcpStream>,
-    tcp: TcpStream,
-    buffer_size: usize,
-) -> Result<()> {
+async fn proxy<S>(websocket: WebSocketStream<S>, tcp: TcpStream, buffer_size: usize) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let (mut ws_writer, mut ws_reader) = websocket.split();
     let (mut tcp_reader, mut tcp_writer) = tcp.into_split();
     let mut tcp_buffer = vec![0_u8; buffer_size];

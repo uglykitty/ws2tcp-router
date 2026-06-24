@@ -33,6 +33,14 @@ pub struct Args {
     #[arg(long, value_name = "PATH")]
     pub basic_auth_file: Option<PathBuf>,
 
+    /// PEM-encoded TLS certificate chain for serving WSS.
+    #[arg(long, value_name = "PATH", requires = "tls_key")]
+    pub tls_cert: Option<PathBuf>,
+
+    /// PEM-encoded TLS private key for serving WSS.
+    #[arg(long, value_name = "PATH", requires = "tls_cert")]
+    pub tls_key: Option<PathBuf>,
+
     /// Append logs to this file instead of standard error.
     #[arg(long, value_name = "PATH")]
     pub log_file: Option<PathBuf>,

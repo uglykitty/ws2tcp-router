@@ -111,6 +111,18 @@ Then connect with a WebSocket client:
 ws://10.15.108.29:8000/tcp:116.63.8.64:12345
 ```
 
+Serve WSS with a PEM certificate chain and private key:
+
+```bash
+cargo run -- --bind 0.0.0.0 --port 8443 --tls-cert ./cert.pem --tls-key ./key.pem
+```
+
+Then connect with a secure WebSocket client:
+
+```text
+wss://10.15.108.29:8443/tcp:116.63.8.64:12345
+```
+
 ## Options
 
 ```text
@@ -122,6 +134,8 @@ ws://10.15.108.29:8000/tcp:116.63.8.64:12345
                        Require HTTP Basic authentication. Can be repeated.
 --basic-auth-file <PATH>
                        Load HTTP Basic authentication credentials from a file.
+--tls-cert <PATH>      PEM-encoded TLS certificate chain for serving WSS.
+--tls-key <PATH>       PEM-encoded TLS private key for serving WSS.
 --log-file <PATH>      Append logs to this file instead of standard error.
 --log-level <FILTER>   Logging filter, overriding RUST_LOG. Example: ws2tcp_router=debug
 ```
@@ -172,6 +186,20 @@ bob:secret2
 
 Basic authentication does not encrypt credentials. Use it behind TLS when
 serving untrusted networks.
+
+## TLS / WSS
+
+TLS is disabled by default. Configure both `--tls-cert` and `--tls-key` to serve
+secure WebSocket connections with `wss://`:
+
+```bash
+cargo run -- --port 8443 --tls-cert ./cert.pem --tls-key ./key.pem
+```
+
+`--tls-cert` must point to a PEM certificate chain, and `--tls-key` must point to
+a PEM private key. Configure clients to trust the certificate authority that
+issued the certificate, or use a publicly trusted certificate for public
+deployments.
 
 ## Path Format
 

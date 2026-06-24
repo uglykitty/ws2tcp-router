@@ -162,6 +162,8 @@ mod tests {
             buffer_size: 16 * 1024,
             basic_auth: Vec::new(),
             basic_auth_file: None,
+            tls_cert: None,
+            tls_key: None,
             log_file: None,
             log_level: None,
         }
