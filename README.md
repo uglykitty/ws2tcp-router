@@ -28,8 +28,8 @@ cargo build --release
 Published images are available from GitHub Container Registry:
 
 ```bash
-podman pull ghcr.io/uglykitty/ws2tcp-router:0.1.10
-podman run --rm -p 8000:8000 ghcr.io/uglykitty/ws2tcp-router:0.1.10
+podman pull ghcr.io/uglykitty/ws2tcp-router:0.1.11
+podman run --rm -p 8000:8000 ghcr.io/uglykitty/ws2tcp-router:0.1.11
 ```
 
 Build the image:
@@ -56,8 +56,8 @@ Docker images and GitHub Release binaries are published by GitHub Actions when
 a version tag is pushed:
 
 ```bash
-git tag v0.1.10
-git push origin v0.1.10
+git tag v0.1.11
+git push origin v0.1.11
 ```
 
 The Release contains single-file executables:
@@ -156,6 +156,9 @@ wss://10.15.108.29/tcp:116.63.8.64:12345
                        Require HTTP Basic authentication. Can be repeated.
 --basic-auth-file <PATH>
                        Load HTTP Basic authentication credentials from a file.
+--anonymous-target <HOST:PORT>
+                       Allow anonymous access to this upstream target even when
+                       Basic authentication is enabled. Can be repeated.
 --tls-cert <PATH>      PEM-encoded TLS certificate chain for serving WSS.
 --tls-key <PATH>       PEM-encoded TLS private key for serving WSS.
 --auto-self-signed-cert
@@ -186,6 +189,7 @@ buffer-size = 16384
 
 basic-auth = ["alice:secret", "bob:secret2"]
 basic-auth-file = "./users.txt"
+anonymous-target = ["ocs.wangguofang.net:8443"]
 tls-cert = "./cert.pem"
 tls-key = "./key.pem"
 auto-self-signed-cert = false
@@ -227,6 +231,22 @@ include a matching HTTP Basic `Authorization` header.
 ```bash
 cargo run -- --basic-auth alice:secret --basic-auth bob:secret2
 ```
+
+`--anonymous-target` allows selected upstream targets to skip Basic
+authentication. It accepts one `HOST:PORT` target and can be repeated:
+
+```bash
+cargo run -- --basic-auth alice:secret --anonymous-target ocs.wangguofang.net:8443
+```
+
+The request path must match the configured target exactly after target
+normalization. For example, the command above allows anonymous access to:
+
+```text
+ws://10.15.108.29:8000/tcp:ocs.wangguofang.net:8443
+```
+
+IPv6 targets must use bracket notation, such as `[2001:db8::1]:443`.
 
 `--basic-auth-file` reads one `USER:PASS` credential per line. Empty lines and
 lines beginning with `#` are ignored:

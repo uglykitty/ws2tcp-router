@@ -8,11 +8,12 @@ use tokio_tungstenite::tungstenite::{
 };
 use tracing::warn;
 
-use crate::args::Args;
+use crate::{args::Args, target::parse_target_addr};
 
 #[derive(Debug, Clone)]
 pub struct AuthConfig {
     expected_authorizations: Vec<String>,
+    anonymous_targets: Vec<String>,
 }
 
 const ANONYMOUS_AUTH_USER: &str = "anonymous";
@@ -56,9 +57,19 @@ pub fn build_auth_config(args: &Args) -> Result<Option<AuthConfig>> {
             Ok(format!("Basic {}", STANDARD.encode(credential)))
         })
         .collect::<Result<Vec<_>>>()?;
+    let anonymous_targets = args
+        .anonymous_target
+        .iter()
+        .map(|target| {
+            parse_target_addr(target)
+                .map(|target| target.addr())
+                .with_context(|| format!("invalid anonymous target {target:?}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(Some(AuthConfig {
         expected_authorizations,
+        anonymous_targets,
     }))
 }
 
@@ -87,6 +98,10 @@ pub fn authorize_request(
         return Ok(ANONYMOUS_AUTH_USER.to_owned());
     };
 
+    if auth.allows_anonymous_target(request.uri().path()) {
+        return Ok(ANONYMOUS_AUTH_USER.to_owned());
+    }
+
     let authorization = request
         .headers()
         .get(header::AUTHORIZATION)
@@ -107,6 +122,17 @@ pub fn authorize_request(
     } else {
         warn!(%peer_addr, auth_user = %auth_user, "rejecting websocket request with invalid basic auth");
         Err(unauthorized_response())
+    }
+}
+
+impl AuthConfig {
+    fn allows_anonymous_target(&self, path: &str) -> bool {
+        let Ok(target) = crate::target::parse_target(path) else {
+            return false;
+        };
+        let addr = target.addr();
+
+        self.anonymous_targets.iter().any(|target| target == &addr)
     }
 }
 
@@ -164,6 +190,7 @@ mod tests {
             buffer_size: 16 * 1024,
             basic_auth: Vec::new(),
             basic_auth_file: None,
+            anonymous_target: Vec::new(),
             tls_cert: None,
             tls_key: None,
             auto_self_signed_cert: false,
@@ -216,6 +243,35 @@ mod tests {
     }
 
     #[test]
+    fn builds_basic_auth_config_with_anonymous_targets() {
+        let mut args = default_args();
+        args.basic_auth = vec!["alice:secret".to_owned()];
+        args.anonymous_target = vec![
+            "ocs.wangguofang.net:8443".to_owned(),
+            "[2001:db8::1]:443".to_owned(),
+        ];
+
+        let auth = build_auth_config(&args).unwrap().unwrap();
+
+        assert_eq!(
+            auth.anonymous_targets,
+            vec![
+                "ocs.wangguofang.net:8443".to_owned(),
+                "[2001:db8::1]:443".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_anonymous_target() {
+        let mut args = default_args();
+        args.basic_auth = vec!["alice:secret".to_owned()];
+        args.anonymous_target = vec!["2001:db8::1:443".to_owned()];
+
+        assert!(build_auth_config(&args).is_err());
+    }
+
+    #[test]
     fn rejects_empty_basic_auth_file_when_auth_is_enabled() {
         let mut path = std::env::temp_dir();
         path.push(format!(
@@ -249,6 +305,7 @@ mod tests {
         let request = request_with_authorization(None);
         let auth = AuthConfig {
             expected_authorizations: vec!["Basic YWxpY2U6c2VjcmV0".to_owned()],
+            anonymous_targets: Vec::new(),
         };
         let peer_addr = "127.0.0.1:12345".parse().unwrap();
 
@@ -266,6 +323,7 @@ mod tests {
         let request = request_with_authorization(Some("Basic Ym9iOnNlY3JldA=="));
         let auth = AuthConfig {
             expected_authorizations: vec!["Basic YWxpY2U6c2VjcmV0".to_owned()],
+            anonymous_targets: Vec::new(),
         };
         let peer_addr = "127.0.0.1:12345".parse().unwrap();
 
@@ -280,6 +338,7 @@ mod tests {
                 "Basic YWxpY2U6c2VjcmV0".to_owned(),
                 "Basic Ym9iOnNlY3JldDI=".to_owned(),
             ],
+            anonymous_targets: Vec::new(),
         };
         let peer_addr = "127.0.0.1:12345".parse().unwrap();
 
@@ -287,5 +346,38 @@ mod tests {
             authorize_request(&request, Some(&auth), peer_addr).unwrap(),
             "bob"
         );
+    }
+
+    #[test]
+    fn allows_request_without_basic_auth_header_for_anonymous_target() {
+        let request = Request::builder()
+            .uri(Uri::from_static("/tcp:ocs.wangguofang.net:8443"))
+            .body(())
+            .unwrap();
+        let auth = AuthConfig {
+            expected_authorizations: vec!["Basic YWxpY2U6c2VjcmV0".to_owned()],
+            anonymous_targets: vec!["ocs.wangguofang.net:8443".to_owned()],
+        };
+        let peer_addr = "127.0.0.1:12345".parse().unwrap();
+
+        assert_eq!(
+            authorize_request(&request, Some(&auth), peer_addr).unwrap(),
+            ANONYMOUS_AUTH_USER
+        );
+    }
+
+    #[test]
+    fn rejects_request_without_basic_auth_header_for_non_anonymous_target() {
+        let request = Request::builder()
+            .uri(Uri::from_static("/tcp:other.example:8443"))
+            .body(())
+            .unwrap();
+        let auth = AuthConfig {
+            expected_authorizations: vec!["Basic YWxpY2U6c2VjcmV0".to_owned()],
+            anonymous_targets: vec!["ocs.wangguofang.net:8443".to_owned()],
+        };
+        let peer_addr = "127.0.0.1:12345".parse().unwrap();
+
+        assert!(authorize_request(&request, Some(&auth), peer_addr).is_err());
     }
 }

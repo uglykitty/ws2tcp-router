@@ -19,6 +19,7 @@ pub struct Args {
     pub buffer_size: usize,
     pub basic_auth: Vec<String>,
     pub basic_auth_file: Option<PathBuf>,
+    pub anonymous_target: Vec<String>,
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
     pub auto_self_signed_cert: bool,
@@ -103,6 +104,11 @@ impl Args {
                 cli.basic_auth
             },
             basic_auth_file: cli.basic_auth_file.or(config.basic_auth_file),
+            anonymous_target: if cli.anonymous_target.is_empty() {
+                config.anonymous_target.unwrap_or_default()
+            } else {
+                cli.anonymous_target
+            },
             tls_cert,
             tls_key,
             auto_self_signed_cert,
@@ -117,6 +123,11 @@ impl Args {
     fn validate(&self) -> Result<()> {
         if self.buffer_size == 0 {
             bail!("--buffer-size must be greater than 0");
+        }
+
+        for target in &self.anonymous_target {
+            crate::target::parse_target_addr(target)
+                .with_context(|| format!("invalid anonymous target {target:?}"))?;
         }
 
         if self.tls_cert.is_some() != self.tls_key.is_some() {
@@ -209,6 +220,10 @@ struct CliArgs {
     #[arg(long, value_name = "PATH")]
     basic_auth_file: Option<PathBuf>,
 
+    /// Allow anonymous access to this upstream target even when Basic authentication is enabled.
+    #[arg(long, value_name = "HOST:PORT")]
+    anonymous_target: Vec<String>,
+
     /// PEM-encoded TLS certificate chain for serving WSS.
     #[arg(long, value_name = "PATH")]
     tls_cert: Option<PathBuf>,
@@ -248,6 +263,7 @@ struct ConfigArgs {
     buffer_size: Option<usize>,
     basic_auth: Option<Vec<String>>,
     basic_auth_file: Option<PathBuf>,
+    anonymous_target: Option<Vec<String>>,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
     auto_self_signed_cert: Option<bool>,
@@ -298,6 +314,7 @@ mod tests {
         assert!(!args.ipv6_only);
         assert_eq!(args.buffer_size, DEFAULT_BUFFER_SIZE);
         assert!(args.basic_auth.is_empty());
+        assert!(args.anonymous_target.is_empty());
         assert!(args.tls_cert.is_none());
         assert!(args.tls_key.is_none());
         assert!(!args.auto_self_signed_cert);
@@ -317,6 +334,7 @@ ipv6-only = true
 buffer-size = 4096
 basic-auth = ["alice:secret"]
 basic-auth-file = "./users.txt"
+anonymous-target = ["ocs.wangguofang.net:8443"]
 tls-cert = "./cert.pem"
 tls-key = "./key.pem"
 auto-self-signed-cert = false
@@ -337,6 +355,7 @@ log-level = "ws2tcp_router=debug"
         assert_eq!(args.buffer_size, 4096);
         assert_eq!(args.basic_auth, vec!["alice:secret"]);
         assert_eq!(args.basic_auth_file, Some(PathBuf::from("./users.txt")));
+        assert_eq!(args.anonymous_target, vec!["ocs.wangguofang.net:8443"]);
         assert_eq!(args.tls_cert, Some(PathBuf::from("./cert.pem")));
         assert_eq!(args.tls_key, Some(PathBuf::from("./key.pem")));
         assert!(!args.auto_self_signed_cert);
@@ -356,6 +375,7 @@ service-mode = "ws-only"
 ipv6-only = true
 buffer-size = 4096
 basic-auth = ["alice:secret"]
+anonymous-target = ["config.example:443"]
 tls-cert = "./config-cert.pem"
 tls-key = "./config-key.pem"
 "#,
@@ -378,6 +398,8 @@ tls-key = "./config-key.pem"
             "8192",
             "--basic-auth",
             "bob:secret",
+            "--anonymous-target",
+            "cli.example:443",
             "--tls-cert",
             "./cli-cert.pem",
             "--tls-key",
@@ -392,6 +414,7 @@ tls-key = "./config-key.pem"
         assert!(!args.ipv6_only);
         assert_eq!(args.buffer_size, 8192);
         assert_eq!(args.basic_auth, vec!["bob:secret"]);
+        assert_eq!(args.anonymous_target, vec!["cli.example:443"]);
         assert_eq!(args.tls_cert, Some(PathBuf::from("./cli-cert.pem")));
         assert_eq!(args.tls_key, Some(PathBuf::from("./cli-key.pem")));
     }

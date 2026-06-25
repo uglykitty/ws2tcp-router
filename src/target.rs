@@ -17,6 +17,10 @@ pub fn parse_target(path: &str) -> Result<Target> {
         .strip_prefix("/tcp:")
         .ok_or_else(|| anyhow!("path must start with /tcp:"))?;
 
+    parse_target_addr(target)
+}
+
+pub fn parse_target_addr(target: &str) -> Result<Target> {
     let (host, port) = if let Some(rest) = target.strip_prefix('[') {
         let (host, port) = rest
             .split_once("]:")
@@ -55,6 +59,14 @@ mod tests {
         let target = parse_target("/tcp:116.63.8.64:12345").unwrap();
         assert_eq!(target.host, "116.63.8.64");
         assert_eq!(target.port, 12345);
+    }
+
+    #[test]
+    fn parse_target_from_addr() {
+        let target = parse_target_addr("ocs.wangguofang.net:8443").unwrap();
+        assert_eq!(target.host, "ocs.wangguofang.net");
+        assert_eq!(target.port, 8443);
+        assert_eq!(target.addr(), "ocs.wangguofang.net:8443");
     }
 
     #[test]

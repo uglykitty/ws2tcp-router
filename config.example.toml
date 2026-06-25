@@ -11,6 +11,7 @@ buffer-size = 16384
 # HTTP Basic authentication is disabled when both options are omitted.
 # basic-auth = ["alice:secret", "bob:secret2"]
 # basic-auth-file = "./users.txt"
+# anonymous-target = ["ocs.wangguofang.net:8443"]
 
 # Configure both TLS fields to serve WSS.
 # tls-cert = "./cert.pem"
