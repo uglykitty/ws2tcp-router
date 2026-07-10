@@ -28,8 +28,8 @@ cargo build --release
 Published images are available from GitHub Container Registry:
 
 ```bash
-podman pull ghcr.io/uglykitty/ws2tcp-router:0.1.11
-podman run --rm -p 8000:8000 ghcr.io/uglykitty/ws2tcp-router:0.1.11
+podman pull ghcr.io/uglykitty/ws2tcp-router:0.1.12
+podman run --rm -p 8000:8000 ghcr.io/uglykitty/ws2tcp-router:0.1.12
 ```
 
 Build the image:
@@ -56,8 +56,8 @@ Docker images and GitHub Release binaries are published by GitHub Actions when
 a version tag is pushed:
 
 ```bash
-git tag v0.1.11
-git push origin v0.1.11
+git tag v0.1.12
+git push origin v0.1.12
 ```
 
 The Release contains single-file executables:
