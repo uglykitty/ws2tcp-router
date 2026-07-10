@@ -12,7 +12,7 @@ mod target;
 mod tls;
 
 use args::Args;
-use auth::build_auth_config;
+use auth::{build_auth_config, spawn_auth_file_reloader};
 use listener::{bind_listener, resolve_bind_addr};
 use logging::init_logging;
 use proxy::handle_connection;
@@ -27,6 +27,9 @@ async fn main() -> Result<()> {
     let _log_guard = init_logging(&args)?;
 
     let auth = build_auth_config(&args)?.map(Arc::new);
+    if let Some(auth) = &auth {
+        spawn_auth_file_reloader(Arc::clone(auth));
+    }
     let tls_config = if args.service_mode.includes_wss() {
         build_tls_config(&args)?
     } else {

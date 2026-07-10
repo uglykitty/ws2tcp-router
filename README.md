@@ -257,6 +257,11 @@ alice:secret
 bob:secret2
 ```
 
+The file is checked once per second and reloaded without restarting the
+service. If a changed file cannot be read, contains an invalid credential, or
+contains no credentials (unless `--basic-auth` also supplies one), the service
+keeps using the last valid credentials and logs a warning.
+
 Basic authentication does not encrypt credentials. Use it behind TLS when
 serving untrusted networks.
 
