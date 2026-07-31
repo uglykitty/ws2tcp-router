@@ -20,6 +20,7 @@ pub struct Args {
     pub basic_auth: Vec<String>,
     pub basic_auth_file: Option<PathBuf>,
     pub anonymous_target: Vec<String>,
+    pub anonymous_target_file: Option<PathBuf>,
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
     pub auto_self_signed_cert: bool,
@@ -109,6 +110,7 @@ impl Args {
             } else {
                 cli.anonymous_target
             },
+            anonymous_target_file: cli.anonymous_target_file.or(config.anonymous_target_file),
             tls_cert,
             tls_key,
             auto_self_signed_cert,
@@ -224,6 +226,10 @@ struct CliArgs {
     #[arg(long, value_name = "HOST:PORT")]
     anonymous_target: Vec<String>,
 
+    /// Load anonymous upstream targets from a line-based HOST:PORT file.
+    #[arg(long, value_name = "PATH")]
+    anonymous_target_file: Option<PathBuf>,
+
     /// PEM-encoded TLS certificate chain for serving WSS.
     #[arg(long, value_name = "PATH")]
     tls_cert: Option<PathBuf>,
@@ -264,6 +270,7 @@ struct ConfigArgs {
     basic_auth: Option<Vec<String>>,
     basic_auth_file: Option<PathBuf>,
     anonymous_target: Option<Vec<String>>,
+    anonymous_target_file: Option<PathBuf>,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
     auto_self_signed_cert: Option<bool>,
@@ -315,6 +322,7 @@ mod tests {
         assert_eq!(args.buffer_size, DEFAULT_BUFFER_SIZE);
         assert!(args.basic_auth.is_empty());
         assert!(args.anonymous_target.is_empty());
+        assert!(args.anonymous_target_file.is_none());
         assert!(args.tls_cert.is_none());
         assert!(args.tls_key.is_none());
         assert!(!args.auto_self_signed_cert);
@@ -335,6 +343,7 @@ buffer-size = 4096
 basic-auth = ["alice:secret"]
 basic-auth-file = "./users.txt"
 anonymous-target = ["ocs.wangguofang.net:8443"]
+anonymous-target-file = "./anonymous-targets.txt"
 tls-cert = "./cert.pem"
 tls-key = "./key.pem"
 auto-self-signed-cert = false
@@ -356,6 +365,10 @@ log-level = "ws2tcp_router=debug"
         assert_eq!(args.basic_auth, vec!["alice:secret"]);
         assert_eq!(args.basic_auth_file, Some(PathBuf::from("./users.txt")));
         assert_eq!(args.anonymous_target, vec!["ocs.wangguofang.net:8443"]);
+        assert_eq!(
+            args.anonymous_target_file,
+            Some(PathBuf::from("./anonymous-targets.txt"))
+        );
         assert_eq!(args.tls_cert, Some(PathBuf::from("./cert.pem")));
         assert_eq!(args.tls_key, Some(PathBuf::from("./key.pem")));
         assert!(!args.auto_self_signed_cert);
@@ -376,6 +389,7 @@ ipv6-only = true
 buffer-size = 4096
 basic-auth = ["alice:secret"]
 anonymous-target = ["config.example:443"]
+anonymous-target-file = "./config-anonymous-targets.txt"
 tls-cert = "./config-cert.pem"
 tls-key = "./config-key.pem"
 "#,
@@ -400,6 +414,8 @@ tls-key = "./config-key.pem"
             "bob:secret",
             "--anonymous-target",
             "cli.example:443",
+            "--anonymous-target-file",
+            "./cli-anonymous-targets.txt",
             "--tls-cert",
             "./cli-cert.pem",
             "--tls-key",
@@ -415,6 +431,10 @@ tls-key = "./config-key.pem"
         assert_eq!(args.buffer_size, 8192);
         assert_eq!(args.basic_auth, vec!["bob:secret"]);
         assert_eq!(args.anonymous_target, vec!["cli.example:443"]);
+        assert_eq!(
+            args.anonymous_target_file,
+            Some(PathBuf::from("./cli-anonymous-targets.txt"))
+        );
         assert_eq!(args.tls_cert, Some(PathBuf::from("./cli-cert.pem")));
         assert_eq!(args.tls_key, Some(PathBuf::from("./cli-key.pem")));
     }

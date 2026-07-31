@@ -12,6 +12,7 @@ buffer-size = 16384
 # basic-auth = ["alice:secret", "bob:secret2"]
 # basic-auth-file = "./users.txt"
 # anonymous-target = ["ocs.wangguofang.net:8443"]
+# anonymous-target-file = "./anonymous-targets.txt"
 
 # Configure both TLS fields to serve WSS.
 # tls-cert = "./cert.pem"

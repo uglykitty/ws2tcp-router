@@ -21,7 +21,9 @@ pub struct AuthConfig {
     expected_authorizations: RwLock<Vec<String>>,
     fixed_authorizations: Vec<String>,
     basic_auth_file: Option<PathBuf>,
-    anonymous_targets: Vec<String>,
+    anonymous_targets: RwLock<Vec<String>>,
+    fixed_anonymous_targets: Vec<String>,
+    anonymous_target_file: Option<PathBuf>,
 }
 
 const ANONYMOUS_AUTH_USER: &str = "anonymous";
@@ -47,22 +49,58 @@ pub fn build_auth_config(args: &Args) -> Result<Option<AuthConfig>> {
         bail!("basic auth is enabled, but no credentials were configured");
     }
 
-    let anonymous_targets = args
-        .anonymous_target
+    let fixed_anonymous_targets = normalize_anonymous_targets(&args.anonymous_target)?;
+    let file_anonymous_targets = args
+        .anonymous_target_file
+        .as_deref()
+        .map(load_anonymous_target_file)
+        .transpose()?
+        .unwrap_or_default();
+    let mut anonymous_targets = fixed_anonymous_targets.clone();
+    anonymous_targets.extend(file_anonymous_targets);
+
+    Ok(Some(AuthConfig {
+        expected_authorizations: RwLock::new(expected_authorizations),
+        fixed_authorizations,
+        basic_auth_file: args.basic_auth_file.clone(),
+        anonymous_targets: RwLock::new(anonymous_targets),
+        fixed_anonymous_targets,
+        anonymous_target_file: args.anonymous_target_file.clone(),
+    }))
+}
+
+fn normalize_anonymous_targets(targets: &[String]) -> Result<Vec<String>> {
+    targets
         .iter()
         .map(|target| {
             parse_target_addr(target)
                 .map(|target| target.addr())
                 .with_context(|| format!("invalid anonymous target {target:?}"))
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect()
+}
 
-    Ok(Some(AuthConfig {
-        expected_authorizations: RwLock::new(expected_authorizations),
-        fixed_authorizations,
-        basic_auth_file: args.basic_auth_file.clone(),
-        anonymous_targets,
-    }))
+fn load_anonymous_target_file(path: &Path) -> Result<Vec<String>> {
+    let file = fs::read_to_string(path)
+        .with_context(|| format!("failed to read anonymous target file {}", path.display()))?;
+    file.lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let target = line.trim();
+            (!target.is_empty() && !target.starts_with('#')).then_some((index, target))
+        })
+        .map(|(index, target)| {
+            parse_target_addr(target)
+                .map(|target| target.addr())
+                .with_context(|| {
+                    format!(
+                        "invalid anonymous target in {} at line {}",
+                        path.display(),
+                        index + 1
+                    )
+                })
+        })
+        .collect()
 }
 
 fn encode_credentials(credentials: &[String]) -> Result<Vec<String>> {
@@ -101,36 +139,47 @@ fn load_auth_file(path: &Path) -> Result<Vec<String>> {
 }
 
 pub fn spawn_auth_file_reloader(auth: Arc<AuthConfig>) {
-    let Some(path) = auth.basic_auth_file.clone() else {
-        return;
-    };
+    if let Some(path) = auth.basic_auth_file.clone() {
+        let auth = Arc::clone(&auth);
+        tokio::spawn(async move {
+            poll_file_reload(&path, "basic auth", || auth.reload_auth_file(&path)).await;
+        });
+    }
+    if let Some(path) = auth.anonymous_target_file.clone() {
+        tokio::spawn(async move {
+            poll_file_reload(&path, "anonymous target", || {
+                auth.reload_anonymous_target_file(&path)
+            })
+            .await;
+        });
+    }
+}
 
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
-        let mut last_error = None;
+async fn poll_file_reload(path: &Path, kind: &str, mut reload: impl FnMut() -> Result<bool>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    let mut last_error = None;
+    interval.tick().await;
+    loop {
         interval.tick().await;
-        loop {
-            interval.tick().await;
-            match auth.reload_auth_file(&path) {
-                Ok(true) => {
-                    last_error = None;
-                    info!(path = %path.display(), "reloaded basic auth file");
-                }
-                Ok(false) => last_error = None,
-                Err(err) => {
-                    let error = format!("{err:#}");
-                    if last_error.as_deref() != Some(error.as_str()) {
-                        warn!(
-                            path = %path.display(),
-                            error,
-                            "failed to reload basic auth file; retaining previous credentials"
-                        );
-                        last_error = Some(error);
-                    }
+        match reload() {
+            Ok(true) => {
+                last_error = None;
+                info!(path = %path.display(), "reloaded {kind} file");
+            }
+            Ok(false) => last_error = None,
+            Err(err) => {
+                let error = format!("{err:#}");
+                if last_error.as_deref() != Some(error.as_str()) {
+                    warn!(
+                        path = %path.display(),
+                        error,
+                        "failed to reload {kind} file; retaining previous values"
+                    );
+                    last_error = Some(error);
                 }
             }
         }
-    });
+    }
 }
 
 fn validate_basic_auth_credential(credential: &str) -> Result<()> {
@@ -215,7 +264,26 @@ impl AuthConfig {
         };
         let addr = target.addr();
 
-        self.anonymous_targets.iter().any(|target| target == &addr)
+        self.anonymous_targets
+            .read()
+            .expect("anonymous targets lock poisoned")
+            .iter()
+            .any(|target| target == &addr)
+    }
+
+    fn reload_anonymous_target_file(&self, path: &Path) -> Result<bool> {
+        let file_targets = load_anonymous_target_file(path)?;
+        let mut next = self.fixed_anonymous_targets.clone();
+        next.extend(file_targets);
+        let mut current = self
+            .anonymous_targets
+            .write()
+            .expect("anonymous targets lock poisoned");
+        if *current == next {
+            return Ok(false);
+        }
+        *current = next;
+        Ok(true)
     }
 }
 
@@ -274,6 +342,7 @@ mod tests {
             basic_auth: Vec::new(),
             basic_auth_file: None,
             anonymous_target: Vec::new(),
+            anonymous_target_file: None,
             tls_cert: None,
             tls_key: None,
             auto_self_signed_cert: false,
@@ -337,12 +406,63 @@ mod tests {
         let auth = build_auth_config(&args).unwrap().unwrap();
 
         assert_eq!(
-            auth.anonymous_targets,
+            *auth.anonymous_targets.read().unwrap(),
             vec![
                 "ocs.wangguofang.net:8443".to_owned(),
                 "[2001:db8::1]:443".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn loads_and_reloads_anonymous_target_file() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "ws2tcp-router-anonymous-targets-{}.txt",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            "# public targets\nfile.example:443\n\n[2001:db8::1]:8443\n",
+        )
+        .unwrap();
+
+        let mut args = default_args();
+        args.basic_auth = vec!["alice:secret".to_owned()];
+        args.anonymous_target = vec!["fixed.example:80".to_owned()];
+        args.anonymous_target_file = Some(path.clone());
+        let auth = build_auth_config(&args).unwrap().unwrap();
+
+        assert_eq!(
+            *auth.anonymous_targets.read().unwrap(),
+            vec![
+                "fixed.example:80".to_owned(),
+                "file.example:443".to_owned(),
+                "[2001:db8::1]:8443".to_owned(),
+            ]
+        );
+
+        fs::write(&path, "updated.example:9443\n").unwrap();
+        assert!(auth.reload_anonymous_target_file(&path).unwrap());
+        assert_eq!(
+            *auth.anonymous_targets.read().unwrap(),
+            vec![
+                "fixed.example:80".to_owned(),
+                "updated.example:9443".to_owned(),
+            ]
+        );
+
+        fs::write(&path, "invalid\n").unwrap();
+        assert!(auth.reload_anonymous_target_file(&path).is_err());
+        assert_eq!(
+            *auth.anonymous_targets.read().unwrap(),
+            vec![
+                "fixed.example:80".to_owned(),
+                "updated.example:9443".to_owned(),
+            ]
+        );
+
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -419,7 +539,9 @@ mod tests {
             expected_authorizations: RwLock::new(vec!["Basic YWxpY2U6c2VjcmV0".to_owned()]),
             fixed_authorizations: Vec::new(),
             basic_auth_file: None,
-            anonymous_targets: Vec::new(),
+            anonymous_targets: RwLock::new(Vec::new()),
+            fixed_anonymous_targets: Vec::new(),
+            anonymous_target_file: None,
         };
         let peer_addr = "127.0.0.1:12345".parse().unwrap();
 
@@ -439,7 +561,9 @@ mod tests {
             expected_authorizations: RwLock::new(vec!["Basic YWxpY2U6c2VjcmV0".to_owned()]),
             fixed_authorizations: Vec::new(),
             basic_auth_file: None,
-            anonymous_targets: Vec::new(),
+            anonymous_targets: RwLock::new(Vec::new()),
+            fixed_anonymous_targets: Vec::new(),
+            anonymous_target_file: None,
         };
         let peer_addr = "127.0.0.1:12345".parse().unwrap();
 
@@ -456,7 +580,9 @@ mod tests {
             ]),
             fixed_authorizations: Vec::new(),
             basic_auth_file: None,
-            anonymous_targets: Vec::new(),
+            anonymous_targets: RwLock::new(Vec::new()),
+            fixed_anonymous_targets: Vec::new(),
+            anonymous_target_file: None,
         };
         let peer_addr = "127.0.0.1:12345".parse().unwrap();
 
@@ -476,7 +602,9 @@ mod tests {
             expected_authorizations: RwLock::new(vec!["Basic YWxpY2U6c2VjcmV0".to_owned()]),
             fixed_authorizations: Vec::new(),
             basic_auth_file: None,
-            anonymous_targets: vec!["ocs.wangguofang.net:8443".to_owned()],
+            anonymous_targets: RwLock::new(vec!["ocs.wangguofang.net:8443".to_owned()]),
+            fixed_anonymous_targets: Vec::new(),
+            anonymous_target_file: None,
         };
         let peer_addr = "127.0.0.1:12345".parse().unwrap();
 
@@ -496,7 +624,9 @@ mod tests {
             expected_authorizations: RwLock::new(vec!["Basic YWxpY2U6c2VjcmV0".to_owned()]),
             fixed_authorizations: Vec::new(),
             basic_auth_file: None,
-            anonymous_targets: vec!["ocs.wangguofang.net:8443".to_owned()],
+            anonymous_targets: RwLock::new(vec!["ocs.wangguofang.net:8443".to_owned()]),
+            fixed_anonymous_targets: Vec::new(),
+            anonymous_target_file: None,
         };
         let peer_addr = "127.0.0.1:12345".parse().unwrap();
 

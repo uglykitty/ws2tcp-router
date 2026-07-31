@@ -28,8 +28,8 @@ cargo build --release
 Published images are available from GitHub Container Registry:
 
 ```bash
-podman pull ghcr.io/uglykitty/ws2tcp-router:0.1.12
-podman run --rm -p 8000:8000 ghcr.io/uglykitty/ws2tcp-router:0.1.12
+podman pull ghcr.io/uglykitty/ws2tcp-router:0.1.13
+podman run --rm -p 8000:8000 ghcr.io/uglykitty/ws2tcp-router:0.1.13
 ```
 
 Build the image:
@@ -56,8 +56,8 @@ Docker images and GitHub Release binaries are published by GitHub Actions when
 a version tag is pushed:
 
 ```bash
-git tag v0.1.12
-git push origin v0.1.12
+git tag v0.1.13
+git push origin v0.1.13
 ```
 
 The Release contains single-file executables:
@@ -159,6 +159,8 @@ wss://10.15.108.29/tcp:116.63.8.64:12345
 --anonymous-target <HOST:PORT>
                        Allow anonymous access to this upstream target even when
                        Basic authentication is enabled. Can be repeated.
+--anonymous-target-file <PATH>
+                       Load anonymous upstream targets from a file.
 --tls-cert <PATH>      PEM-encoded TLS certificate chain for serving WSS.
 --tls-key <PATH>       PEM-encoded TLS private key for serving WSS.
 --auto-self-signed-cert
@@ -190,6 +192,7 @@ buffer-size = 16384
 basic-auth = ["alice:secret", "bob:secret2"]
 basic-auth-file = "./users.txt"
 anonymous-target = ["ocs.wangguofang.net:8443"]
+anonymous-target-file = "./anonymous-targets.txt"
 tls-cert = "./cert.pem"
 tls-key = "./key.pem"
 auto-self-signed-cert = false
@@ -247,6 +250,20 @@ ws://10.15.108.29:8000/tcp:ocs.wangguofang.net:8443
 ```
 
 IPv6 targets must use bracket notation, such as `[2001:db8::1]:443`.
+
+`--anonymous-target-file` reads one `HOST:PORT` target per line. Empty lines and
+lines beginning with `#` are ignored:
+
+```text
+# anonymous-targets.txt
+ocs.wangguofang.net:8443
+[2001:db8::1]:443
+```
+
+Targets from the file are combined with any repeated `--anonymous-target`
+options. The file is checked once per second and reloaded without restarting
+the service. If it cannot be read or contains an invalid target, the service
+keeps using the last valid targets and logs a warning.
 
 `--basic-auth-file` reads one `USER:PASS` credential per line. Empty lines and
 lines beginning with `#` are ignored:
