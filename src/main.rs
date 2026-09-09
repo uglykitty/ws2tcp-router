@@ -1,4 +1,4 @@
-use std::{future::pending, sync::Arc};
+use std::{future::pending, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use tracing::{info, warn};
@@ -35,6 +35,7 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    let udp_idle_timeout = Duration::from_secs(args.udp_idle_timeout);
 
     if args.service_mode.includes_ws() {
         let bind_addr = resolve_bind_addr(&args.bind, args.port)?;
@@ -44,6 +45,7 @@ async fn main() -> Result<()> {
             "ws",
             listener,
             args.buffer_size,
+            udp_idle_timeout,
             auth.clone(),
             None,
         ));
@@ -61,6 +63,7 @@ async fn main() -> Result<()> {
             "wss",
             listener,
             args.buffer_size,
+            udp_idle_timeout,
             auth.clone(),
             Some(tls_config),
         ));
@@ -74,6 +77,7 @@ async fn serve_listener(
     scheme: &'static str,
     listener: TcpListener,
     buffer_size: usize,
+    udp_idle_timeout: Duration,
     auth: Option<Arc<auth::AuthConfig>>,
     tls_config: Option<Arc<ServerConfig>>,
 ) -> Result<()> {
@@ -86,9 +90,16 @@ async fn serve_listener(
         let tls_config = tls_config.clone();
 
         tokio::spawn(async move {
-            let result = handle_accepted_stream(stream, peer_addr, buffer_size, auth, tls_config)
-                .await
-                .with_context(|| format!("{scheme} connection failed"));
+            let result = handle_accepted_stream(
+                stream,
+                peer_addr,
+                buffer_size,
+                udp_idle_timeout,
+                auth,
+                tls_config,
+            )
+            .await
+            .with_context(|| format!("{scheme} connection failed"));
 
             if let Err(err) = result {
                 warn!(%peer_addr, error = %format_args!("{err:#}"), "connection closed with error");
@@ -101,6 +112,7 @@ async fn handle_accepted_stream(
     stream: TcpStream,
     peer_addr: std::net::SocketAddr,
     buffer_size: usize,
+    udp_idle_timeout: Duration,
     auth: Option<Arc<auth::AuthConfig>>,
     tls_config: Option<Arc<ServerConfig>>,
 ) -> Result<()> {
@@ -111,8 +123,8 @@ async fn handle_accepted_stream(
                 .accept(stream)
                 .await
                 .context("tls handshake failed")?;
-            handle_connection(stream, peer_addr, buffer_size, auth).await
+            handle_connection(stream, peer_addr, buffer_size, auth, udp_idle_timeout).await
         }
-        None => handle_connection(stream, peer_addr, buffer_size, auth).await,
+        None => handle_connection(stream, peer_addr, buffer_size, auth, udp_idle_timeout).await,
     }
 }

@@ -1,6 +1,6 @@
 # ws2tcp-router
 
-`ws2tcp-router` is a small Tokio-based proxy that accepts WebSocket connections and forwards each connection to a TCP upstream selected by the request path.
+`ws2tcp-router` is a small Tokio-based proxy that accepts WebSocket connections and forwards each connection to a TCP or UDP upstream selected by the request path.
 
 For example:
 
@@ -16,6 +16,18 @@ means:
 - forward TCP bytes back as WebSocket binary frames
 
 Text WebSocket frames are also accepted and forwarded to TCP as UTF-8 bytes.
+
+Use `/udp:` instead of `/tcp:` to forward to a UDP upstream:
+
+```text
+ws://10.15.108.29:8000/udp:116.63.8.64:12345
+```
+
+Each WebSocket message is forwarded as one UDP datagram, and each UDP datagram
+received back is forwarded as one WebSocket binary message, preserving
+datagram boundaries. Since UDP has no connection teardown signal, the session
+is closed after `--udp-idle-timeout` seconds without traffic in either
+direction. See [UDP Forwarding](#udp-forwarding) below.
 
 ## Build
 
@@ -152,6 +164,9 @@ wss://10.15.108.29/tcp:116.63.8.64:12345
 --ipv6-only            Only accept IPv6 connections when binding an IPv6 address.
 --no-ipv6-only         Accept both IPv4 and IPv6 when binding an IPv6 address.
 --buffer-size <BYTES>  TCP read buffer size. Default: 16384
+--udp-idle-timeout <SECONDS>
+                       Seconds of inactivity before an idle UDP forwarding
+                       session is closed. Default: 60
 --basic-auth <USER:PASS>
                        Require HTTP Basic authentication. Can be repeated.
 --basic-auth-file <PATH>
@@ -188,6 +203,7 @@ port = 80
 tls-port = 443
 ipv6-only = false
 buffer-size = 16384
+udp-idle-timeout = 60
 
 basic-auth = ["alice:secret", "bob:secret2"]
 basic-auth-file = "./users.txt"
@@ -317,12 +333,14 @@ The request path must be:
 
 ```text
 /tcp:<host>:<port>
+/udp:<host>:<port>
 ```
 
 IPv6 upstream addresses must be enclosed in brackets:
 
 ```text
 /tcp:[<ipv6-address>]:<port>
+/udp:[<ipv6-address>]:<port>
 ```
 
 Examples:
@@ -331,4 +349,42 @@ Examples:
 /tcp:116.63.8.64:12345
 /tcp:example.com:80
 /tcp:[2001:db8::1]:443
+/udp:116.63.8.64:12345
+/udp:[2001:db8::1]:53
 ```
+
+`--anonymous-target` and `--anonymous-target-file` match by `host:port` only,
+regardless of protocol: allowing `ocs.wangguofang.net:8443` permits anonymous
+access to both `/tcp:ocs.wangguofang.net:8443` and
+`/udp:ocs.wangguofang.net:8443`.
+
+## UDP Forwarding
+
+Connect with a `/udp:` path to forward to a UDP upstream instead of TCP:
+
+```bash
+cargo run -- --bind :: --port 8000
+```
+
+```text
+ws://10.15.108.29:8000/udp:116.63.8.64:12345
+```
+
+Each WebSocket message is forwarded as exactly one UDP datagram to the
+upstream, and each UDP datagram received from the upstream is forwarded back
+as exactly one WebSocket binary message. Datagram boundaries are preserved in
+both directions; unlike the TCP path, message contents are never split or
+coalesced.
+
+UDP has no connection or close signal, so the proxy cannot detect when a
+upstream is done responding. Instead, the forwarding session for a WebSocket
+connection is closed after `--udp-idle-timeout` seconds pass with no traffic
+in either direction:
+
+```bash
+cargo run -- --bind :: --port 8000 --udp-idle-timeout 30
+```
+
+The default is 60 seconds. As with any UDP forwarding, delivery, ordering, and
+retransmission are the responsibility of the client and upstream; the proxy
+does not add reliability on top of UDP.

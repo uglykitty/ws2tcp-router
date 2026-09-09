@@ -7,6 +7,7 @@ port = 80
 tls-port = 443
 ipv6-only = false
 buffer-size = 16384
+udp-idle-timeout = 60
 
 # HTTP Basic authentication is disabled when both options are omitted.
 # basic-auth = ["alice:secret", "bob:secret2"]

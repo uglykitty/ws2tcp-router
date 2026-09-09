@@ -8,6 +8,7 @@ const DEFAULT_BIND: &str = "::";
 const DEFAULT_PORT: u16 = 80;
 const DEFAULT_TLS_PORT: u16 = 443;
 const DEFAULT_BUFFER_SIZE: usize = 16 * 1024;
+const DEFAULT_UDP_IDLE_TIMEOUT: u64 = 60;
 
 #[derive(Debug, Clone)]
 pub struct Args {
@@ -17,6 +18,7 @@ pub struct Args {
     pub tls_port: u16,
     pub ipv6_only: bool,
     pub buffer_size: usize,
+    pub udp_idle_timeout: u64,
     pub basic_auth: Vec<String>,
     pub basic_auth_file: Option<PathBuf>,
     pub anonymous_target: Vec<String>,
@@ -99,6 +101,10 @@ impl Args {
                 .buffer_size
                 .or(config.buffer_size)
                 .unwrap_or(DEFAULT_BUFFER_SIZE),
+            udp_idle_timeout: cli
+                .udp_idle_timeout
+                .or(config.udp_idle_timeout)
+                .unwrap_or(DEFAULT_UDP_IDLE_TIMEOUT),
             basic_auth: if cli.basic_auth.is_empty() {
                 config.basic_auth.unwrap_or_default()
             } else {
@@ -125,6 +131,10 @@ impl Args {
     fn validate(&self) -> Result<()> {
         if self.buffer_size == 0 {
             bail!("--buffer-size must be greater than 0");
+        }
+
+        if self.udp_idle_timeout == 0 {
+            bail!("--udp-idle-timeout must be greater than 0");
         }
 
         for target in &self.anonymous_target {
@@ -214,6 +224,10 @@ struct CliArgs {
     #[arg(long)]
     buffer_size: Option<usize>,
 
+    /// Seconds of inactivity before an idle UDP forwarding session is closed.
+    #[arg(long)]
+    udp_idle_timeout: Option<u64>,
+
     /// Require HTTP Basic authentication for WebSocket handshakes. Can be repeated.
     #[arg(long, value_name = "USER:PASS")]
     basic_auth: Vec<String>,
@@ -267,6 +281,7 @@ struct ConfigArgs {
     tls_port: Option<u16>,
     ipv6_only: Option<bool>,
     buffer_size: Option<usize>,
+    udp_idle_timeout: Option<u64>,
     basic_auth: Option<Vec<String>>,
     basic_auth_file: Option<PathBuf>,
     anonymous_target: Option<Vec<String>>,
@@ -320,6 +335,7 @@ mod tests {
         assert_eq!(args.tls_port, DEFAULT_TLS_PORT);
         assert!(!args.ipv6_only);
         assert_eq!(args.buffer_size, DEFAULT_BUFFER_SIZE);
+        assert_eq!(args.udp_idle_timeout, DEFAULT_UDP_IDLE_TIMEOUT);
         assert!(args.basic_auth.is_empty());
         assert!(args.anonymous_target.is_empty());
         assert!(args.anonymous_target_file.is_none());
@@ -340,6 +356,7 @@ port = 8080
 tls-port = 8443
 ipv6-only = true
 buffer-size = 4096
+udp-idle-timeout = 30
 basic-auth = ["alice:secret"]
 basic-auth-file = "./users.txt"
 anonymous-target = ["ocs.wangguofang.net:8443"]
@@ -362,6 +379,7 @@ log-level = "ws2tcp_router=debug"
         assert_eq!(args.tls_port, 8443);
         assert!(args.ipv6_only);
         assert_eq!(args.buffer_size, 4096);
+        assert_eq!(args.udp_idle_timeout, 30);
         assert_eq!(args.basic_auth, vec!["alice:secret"]);
         assert_eq!(args.basic_auth_file, Some(PathBuf::from("./users.txt")));
         assert_eq!(args.anonymous_target, vec!["ocs.wangguofang.net:8443"]);
@@ -387,6 +405,7 @@ port = 8001
 service-mode = "ws-only"
 ipv6-only = true
 buffer-size = 4096
+udp-idle-timeout = 30
 basic-auth = ["alice:secret"]
 anonymous-target = ["config.example:443"]
 anonymous-target-file = "./config-anonymous-targets.txt"
@@ -410,6 +429,8 @@ tls-key = "./config-key.pem"
             "--no-ipv6-only",
             "--buffer-size",
             "8192",
+            "--udp-idle-timeout",
+            "120",
             "--basic-auth",
             "bob:secret",
             "--anonymous-target",
@@ -429,6 +450,7 @@ tls-key = "./config-key.pem"
         assert_eq!(args.tls_port, 9443);
         assert!(!args.ipv6_only);
         assert_eq!(args.buffer_size, 8192);
+        assert_eq!(args.udp_idle_timeout, 120);
         assert_eq!(args.basic_auth, vec!["bob:secret"]);
         assert_eq!(args.anonymous_target, vec!["cli.example:443"]);
         assert_eq!(

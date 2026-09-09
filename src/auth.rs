@@ -339,6 +339,7 @@ mod tests {
             tls_port: 443,
             ipv6_only: false,
             buffer_size: 16 * 1024,
+            udp_idle_timeout: 60,
             basic_auth: Vec::new(),
             basic_auth_file: None,
             anonymous_target: Vec::new(),
