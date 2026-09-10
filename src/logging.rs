@@ -1,4 +1,5 @@
 use std::{
+    env,
     fs::{self, OpenOptions},
     path::Path,
 };
@@ -15,25 +16,49 @@ pub fn init_logging(args: &Args) -> Result<Option<tracing_appender::non_blocking
         None => EnvFilter::try_from_default_env().unwrap_or_else(|_| "ws2tcp_router=info".into()),
     };
 
+    let running_under_systemd = env::var_os("JOURNAL_STREAM").is_some();
+
     if let Some(path) = &args.log_file {
         let (file_writer, guard) = open_log_writer(path)?;
-        let file_layer = tracing_subscriber::fmt::layer()
-            .with_writer(file_writer)
-            .with_ansi(false);
 
-        tracing_subscriber::registry()
-            .with(filter)
-            .with(file_layer)
-            .init();
+        if running_under_systemd {
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(file_writer)
+                        .with_ansi(false)
+                        .without_time(),
+                )
+                .init();
+        } else {
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(file_writer)
+                        .with_ansi(false),
+                )
+                .init();
+        }
 
         Ok(Some(guard))
     } else {
-        let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
-
-        tracing_subscriber::registry()
-            .with(filter)
-            .with(stderr_layer)
-            .init();
+        if running_under_systemd {
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(std::io::stderr)
+                        .without_time(),
+                )
+                .init();
+        } else {
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+                .init();
+        }
 
         Ok(None)
     }
