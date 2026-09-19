@@ -358,6 +358,42 @@ regardless of protocol: allowing `ocs.wangguofang.net:8443` permits anonymous
 access to both `/tcp:ocs.wangguofang.net:8443` and
 `/udp:ocs.wangguofang.net:8443`.
 
+### Health check
+
+A request to the root path `/` does not connect to any upstream, so a client can
+use it to verify that the service is reachable before opening a real connection.
+The server tells the client what happened, in one of two ways:
+
+- **WebSocket** (`ws://10.15.108.29:8000/`): the handshake succeeds, the server
+  sends a text message, then a close frame with code `1000` (normal closure) and
+  reason `health check`.
+- **Plain HTTP** (`curl http://10.15.108.29:8000/`, or `https://` when serving
+  WSS): the server replies `200 OK` with the same text as a `text/plain` body.
+  `HEAD /` returns the headers only.
+
+The text message looks like this:
+
+```text
+ok: ws2tcp-router 0.1.16 is available; health check only, no upstream connected
+```
+
+Each successful health check, in either form, also returns a freshly generated
+random token in the `X-Ws2tcp-Token` response header (on the `101` handshake
+response for WebSocket, and on the `200` response for HTTP). Clients are expected
+to send it back in the `X-Ws2tcp-Token` request header on their proxy requests,
+next to the Basic Auth credentials. **The token is not verified yet**: the server
+neither remembers nor checks it and ignores the header on proxy requests, so
+authentication is still Basic Auth only. Verification is planned for a later
+version.
+
+When Basic Auth is enabled, the health check still requires valid credentials,
+because `/` is not an anonymous target: without them, both forms fail with
+`401 Unauthorized`.
+
+A WebSocket request with a path that is not `/`, `/tcp:` or `/udp:` is rejected
+with `400 Bad Request` and a body explaining the expected path format. Plain
+HTTP requests to any other path are still closed without a response.
+
 ## UDP Forwarding
 
 Connect with a `/udp:` path to forward to a UDP upstream instead of TCP:

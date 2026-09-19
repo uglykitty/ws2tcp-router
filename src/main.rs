@@ -5,11 +5,13 @@ use tracing::{info, warn};
 
 mod args;
 mod auth;
+mod http_probe;
 mod listener;
 mod logging;
 mod proxy;
 mod target;
 mod tls;
+mod token;
 
 use args::Args;
 use auth::{build_auth_config, spawn_auth_file_reloader};

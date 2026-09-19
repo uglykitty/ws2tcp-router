@@ -239,6 +239,21 @@ pub fn authorize_request(
 }
 
 impl AuthConfig {
+    #[cfg(test)]
+    pub fn with_basic_auth_for_test(credential: &str) -> Self {
+        Self {
+            expected_authorizations: RwLock::new(vec![format!(
+                "Basic {}",
+                STANDARD.encode(credential)
+            )]),
+            fixed_authorizations: Vec::new(),
+            basic_auth_file: None,
+            anonymous_targets: RwLock::new(Vec::new()),
+            fixed_anonymous_targets: Vec::new(),
+            anonymous_target_file: None,
+        }
+    }
+
     fn reload_auth_file(&self, path: &Path) -> Result<bool> {
         let file_authorizations = load_auth_file(path)?;
         let mut next = self.fixed_authorizations.clone();
