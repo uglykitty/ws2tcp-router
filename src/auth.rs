@@ -14,7 +14,7 @@ use tokio_tungstenite::tungstenite::{
 };
 use tracing::{info, warn};
 
-use crate::{args::Args, target::parse_target_addr};
+use crate::{args::Args, proxy::request_user_agent, target::parse_target_addr};
 
 #[derive(Debug)]
 pub struct AuthConfig {
@@ -233,7 +233,7 @@ pub fn authorize_request(
     if authorized {
         Ok(auth_user)
     } else {
-        warn!(%peer_addr, auth_user = %auth_user, "rejecting websocket request with invalid basic auth");
+        warn!(%peer_addr, auth_user = %auth_user, user_agent = %request_user_agent(request), "rejecting websocket request with invalid basic auth");
         Err(unauthorized_response())
     }
 }

@@ -16,6 +16,7 @@ use tokio_tungstenite::{
     tungstenite::{
         Message,
         handshake::server::{ErrorResponse, Request, Response},
+        http::header,
     },
 };
 use tracing::{debug, info, warn};
@@ -42,9 +43,13 @@ where
     let target_slot = Arc::clone(&requested_target);
     let authenticated_user = Arc::new(Mutex::new(None));
     let auth_user_slot = Arc::clone(&authenticated_user);
+    let user_agent = Arc::new(Mutex::new(None));
+    let user_agent_slot = Arc::clone(&user_agent);
 
     #[allow(clippy::result_large_err)]
     let websocket = accept_hdr_async(stream, move |request: &Request, response: Response| {
+        *user_agent_slot.lock().expect("user agent mutex poisoned") =
+            Some(request_user_agent(request));
         let auth_user = authorize_request(request, auth.as_deref(), peer_addr)?;
         *auth_user_slot.lock().expect("auth user mutex poisoned") = Some(auth_user.clone());
         capture_requested_target(request, response, &target_slot, peer_addr, &auth_user)
@@ -62,10 +67,15 @@ where
         .expect("auth user mutex poisoned")
         .clone()
         .ok_or_else(|| anyhow!("websocket auth user was not captured"))?;
+    let user_agent = user_agent
+        .lock()
+        .expect("user agent mutex poisoned")
+        .clone()
+        .ok_or_else(|| anyhow!("websocket user agent was not captured"))?;
 
     match target.protocol() {
         Protocol::Tcp => {
-            info!(%peer_addr, auth_user = %auth_user, upstream = %target.addr(), "proxying websocket to tcp");
+            info!(%peer_addr, auth_user = %auth_user, %user_agent, upstream = %target.addr(), "proxying websocket to tcp");
 
             let tcp = TcpStream::connect(target.addr())
                 .await
@@ -74,7 +84,7 @@ where
             proxy_tcp(websocket, tcp, buffer_size).await
         }
         Protocol::Udp => {
-            info!(%peer_addr, auth_user = %auth_user, upstream = %target.addr(), "proxying websocket to udp");
+            info!(%peer_addr, auth_user = %auth_user, %user_agent, upstream = %target.addr(), "proxying websocket to udp");
 
             let udp = connect_udp(&target.addr())
                 .await
@@ -109,6 +119,15 @@ async fn connect_udp(target_addr: &str) -> Result<UdpSocket> {
     Ok(socket)
 }
 
+pub fn request_user_agent(request: &Request) -> String {
+    request
+        .headers()
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("-")
+        .to_owned()
+}
+
 #[allow(clippy::result_large_err)]
 fn capture_requested_target(
     request: &Request,
@@ -126,6 +145,7 @@ fn capture_requested_target(
             warn!(
                 %peer_addr,
                 auth_user = %auth_user,
+                user_agent = %request_user_agent(request),
                 path = %request.uri().path(),
                 error = %err,
                 "rejecting websocket request"
