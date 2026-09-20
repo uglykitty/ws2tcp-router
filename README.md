@@ -732,10 +732,10 @@ health check (`GET /tunnel/`) and, with [token authentication](#token-authentica
 Every connection arrives from the proxy, so without help the logs would show the proxy's
 address for every client. The router reads the client's address from `X-Forwarded-For`
 (nginx does not send it unless it is told to, as in the `proxy_set_header` line above),
-and logs it in the `peer_addr` field of the log lines about that connection:
+and logs it in the `peer` field of the log lines about that connection:
 
 ```text
-DEBUG http health check peer_addr=203.0.113.7 auth_user=alice user_agent=ws2tcp-local/0.1.20
+DEBUG http health check peer=203.0.113.7 user=alice UA=ws2tcp-local/0.1.20
 ```
 
 Any client can send an `X-Forwarded-For` header of its own, so the router believes it

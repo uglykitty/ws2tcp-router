@@ -74,7 +74,7 @@ where
             let user_agent = request_user_agent(&request);
             match authorize_request(&request, auth.as_deref(), peer_addr) {
                 Ok(auth_user) => {
-                    debug!(%peer_addr, auth_user = %auth_user, %user_agent, "http health check");
+                    debug!(peer = %peer_addr, user = %auth_user, UA = %user_agent, "http health check");
                     health_check_response(HEALTH_CHECK_MESSAGE)
                 }
                 Err(response) => response,
@@ -125,7 +125,7 @@ where
 
     let target = match route {
         Route::HealthCheck => {
-            debug!(%peer_addr, auth_user = %auth_user, %user_agent, "websocket health check");
+            debug!(peer = %peer_addr, user = %auth_user, UA = %user_agent, "websocket health check");
             // The client may already be gone; there is nothing more to do either way.
             let _ = websocket
                 .send(Message::Text(HEALTH_CHECK_MESSAGE.into()))
@@ -143,7 +143,7 @@ where
 
     match target.protocol() {
         Protocol::Tcp => {
-            info!(%peer_addr, auth_user = %auth_user, %user_agent, upstream = %target.addr(), "proxying websocket to tcp");
+            info!(peer = %peer_addr, user = %auth_user, UA = %user_agent, upstream = %target.addr(), "proxying websocket to tcp");
 
             let tcp = TcpStream::connect(target.addr())
                 .await
@@ -152,7 +152,7 @@ where
             proxy_tcp(websocket, tcp, buffer_size).await
         }
         Protocol::Udp => {
-            info!(%peer_addr, auth_user = %auth_user, %user_agent, upstream = %target.addr(), "proxying websocket to udp");
+            info!(peer = %peer_addr, user = %auth_user, UA = %user_agent, upstream = %target.addr(), "proxying websocket to udp");
 
             let udp = connect_udp(&target.addr())
                 .await
@@ -216,9 +216,9 @@ fn capture_requested_target(
         }
         Err(err) => {
             warn!(
-                %peer_addr,
-                auth_user = %auth_user,
-                user_agent = %request_user_agent(request),
+                peer = %peer_addr,
+                user = %auth_user,
+                UA = %request_user_agent(request),
                 path = %request.uri().path(),
                 error = %err,
                 "rejecting websocket request"
@@ -899,7 +899,7 @@ mod tests {
         let request = "GET / HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 10.9.9.9, 203.0.113.7\r\n\r\n";
 
         let logs = logs_of(request, TrustedProxies::new(IpRange::loopback())).await;
-        assert!(logs.contains("peer_addr=203.0.113.7"), "{logs}");
+        assert!(logs.contains("peer=203.0.113.7"), "{logs}");
         assert!(!logs.contains("10.9.9.9"), "{logs}");
         assert!(!logs.contains("127.0.0.1"), "{logs}");
     }
@@ -910,13 +910,13 @@ mod tests {
 
         // Nobody trusted: the header is only what the sender claims.
         let logs = logs_of(request, TrustedProxies::default()).await;
-        assert!(logs.contains("peer_addr=127.0.0.1:1"), "{logs}");
+        assert!(logs.contains("peer=127.0.0.1:1"), "{logs}");
         assert!(!logs.contains("203.0.113.7"), "{logs}");
 
         // Someone else trusted: same.
         let other = TrustedProxies::new(vec!["10.0.0.0/8".parse().unwrap()]);
         let logs = logs_of(request, other).await;
-        assert!(logs.contains("peer_addr=127.0.0.1:1"), "{logs}");
+        assert!(logs.contains("peer=127.0.0.1:1"), "{logs}");
     }
 
     #[tokio::test]
@@ -941,6 +941,6 @@ mod tests {
 
         let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
         assert!(logs.contains("websocket health check"), "{logs}");
-        assert!(logs.contains("peer_addr=203.0.113.7"), "{logs}");
+        assert!(logs.contains("peer=203.0.113.7"), "{logs}");
     }
 }

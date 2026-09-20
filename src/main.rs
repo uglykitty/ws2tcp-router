@@ -115,7 +115,7 @@ async fn serve_listener(
             .with_context(|| format!("{scheme} connection failed"));
 
             if let Err(err) = result {
-                warn!(%peer_addr, error = %format_args!("{err:#}"), "connection closed with error");
+                warn!(peer = %peer_addr, error = %format_args!("{err:#}"), "connection closed with error");
             }
         });
     }

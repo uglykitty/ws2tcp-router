@@ -75,12 +75,12 @@ pub fn handle_auth_request(
     match endpoint {
         Endpoint::Login => {
             let Some(user) = authorization.and_then(|value| auth.basic_user(value)) else {
-                warn!(%peer_addr, %user_agent, "rejecting token login with invalid credentials");
+                warn!(peer = %peer_addr, UA = %user_agent, "rejecting token login with invalid credentials");
                 return unauthorized_response(true, None);
             };
             match tokens.login(&user) {
                 Ok(issued) => {
-                    info!(%peer_addr, auth_user = %user, %user_agent, "issued tokens");
+                    info!(peer = %peer_addr, user = %user, UA = %user_agent, "issued tokens");
                     tokens_response(&issued)
                 }
                 Err(err) => token_error_response(&err),
@@ -92,18 +92,18 @@ pub fn handle_auth_request(
             };
             match tokens.refresh(token, |user| auth.has_user(user)) {
                 Ok((user, issued)) => {
-                    info!(%peer_addr, auth_user = %user, %user_agent, "refreshed tokens");
+                    info!(peer = %peer_addr, user = %user, UA = %user_agent, "refreshed tokens");
                     tokens_response(&issued)
                 }
                 Err(TokenError::Invalid) => {
-                    warn!(%peer_addr, %user_agent, "rejecting invalid refresh token");
+                    warn!(peer = %peer_addr, UA = %user_agent, "rejecting invalid refresh token");
                     unauthorized_response(false, Some(BEARER_INVALID_CHALLENGE))
                 }
                 Err(TokenError::Reused { user }) => {
                     warn!(
-                        %peer_addr,
-                        auth_user = %user,
-                        %user_agent,
+                        peer = %peer_addr,
+                        user = %user,
+                        UA = %user_agent,
                         "refresh token reused; the login was revoked"
                     );
                     unauthorized_response(false, Some(BEARER_INVALID_CHALLENGE))
@@ -117,7 +117,7 @@ pub fn handle_auth_request(
             };
             // Answer the same whether or not the token was known, so this is no oracle for tokens.
             if tokens.revoke(token) {
-                info!(%peer_addr, %user_agent, "revoked a login");
+                info!(peer = %peer_addr, UA = %user_agent, "revoked a login");
             }
             no_store(text_response(StatusCode::NO_CONTENT, ""))
         }
