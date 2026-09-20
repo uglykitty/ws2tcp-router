@@ -4,11 +4,15 @@ use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser, ValueEnum};
 use serde::Deserialize;
 
+use crate::client_addr::IpRange;
+
 const DEFAULT_BIND: &str = "::";
 const DEFAULT_PORT: u16 = 80;
 const DEFAULT_TLS_PORT: u16 = 443;
 const DEFAULT_BUFFER_SIZE: usize = 16 * 1024;
 const DEFAULT_UDP_IDLE_TIMEOUT: u64 = 60;
+const DEFAULT_ACCESS_TOKEN_TTL: u64 = 10 * 60;
+const DEFAULT_REFRESH_TOKEN_TTL: u64 = 7 * 24 * 60 * 60;
 
 #[derive(Debug, Clone)]
 pub struct Args {
@@ -23,6 +27,10 @@ pub struct Args {
     pub basic_auth_file: Option<PathBuf>,
     pub anonymous_target: Vec<String>,
     pub anonymous_target_file: Option<PathBuf>,
+    pub trusted_proxy: Vec<IpRange>,
+    pub token_secret_file: Option<PathBuf>,
+    pub access_token_ttl: u64,
+    pub refresh_token_ttl: u64,
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
     pub auto_self_signed_cert: bool,
@@ -117,6 +125,20 @@ impl Args {
                 cli.anonymous_target
             },
             anonymous_target_file: cli.anonymous_target_file.or(config.anonymous_target_file),
+            trusted_proxy: if cli.trusted_proxy.is_empty() {
+                config.trusted_proxy.unwrap_or_else(IpRange::loopback)
+            } else {
+                cli.trusted_proxy
+            },
+            token_secret_file: cli.token_secret_file.or(config.token_secret_file),
+            access_token_ttl: cli
+                .access_token_ttl
+                .or(config.access_token_ttl)
+                .unwrap_or(DEFAULT_ACCESS_TOKEN_TTL),
+            refresh_token_ttl: cli
+                .refresh_token_ttl
+                .or(config.refresh_token_ttl)
+                .unwrap_or(DEFAULT_REFRESH_TOKEN_TTL),
             tls_cert,
             tls_key,
             auto_self_signed_cert,
@@ -140,6 +162,14 @@ impl Args {
         for target in &self.anonymous_target {
             crate::target::parse_target_addr(target)
                 .with_context(|| format!("invalid anonymous target {target:?}"))?;
+        }
+
+        if self.access_token_ttl == 0 {
+            bail!("--access-token-ttl must be greater than 0");
+        }
+
+        if self.refresh_token_ttl == 0 {
+            bail!("--refresh-token-ttl must be greater than 0");
         }
 
         if self.tls_cert.is_some() != self.tls_key.is_some() {
@@ -244,6 +274,25 @@ struct CliArgs {
     #[arg(long, value_name = "PATH")]
     anonymous_target_file: Option<PathBuf>,
 
+    /// Believe `X-Forwarded-For` from connections that come from this reverse proxy, and log the
+    /// client address it reports. An IP address or CIDR range; can be repeated. Default: the
+    /// loopback addresses.
+    #[arg(long, value_name = "IP[/PREFIX]")]
+    trusted_proxy: Vec<IpRange>,
+
+    /// File holding the secret that signs access tokens (at least 32 bytes). A random secret
+    /// is generated at startup when omitted.
+    #[arg(long, value_name = "PATH")]
+    token_secret_file: Option<PathBuf>,
+
+    /// Lifetime of an access token, in seconds.
+    #[arg(long, value_name = "SECONDS")]
+    access_token_ttl: Option<u64>,
+
+    /// Lifetime of a refresh token, in seconds.
+    #[arg(long, value_name = "SECONDS")]
+    refresh_token_ttl: Option<u64>,
+
     /// PEM-encoded TLS certificate chain for serving WSS.
     #[arg(long, value_name = "PATH")]
     tls_cert: Option<PathBuf>,
@@ -286,6 +335,10 @@ struct ConfigArgs {
     basic_auth_file: Option<PathBuf>,
     anonymous_target: Option<Vec<String>>,
     anonymous_target_file: Option<PathBuf>,
+    trusted_proxy: Option<Vec<IpRange>>,
+    token_secret_file: Option<PathBuf>,
+    access_token_ttl: Option<u64>,
+    refresh_token_ttl: Option<u64>,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
     auto_self_signed_cert: Option<bool>,
@@ -604,5 +657,104 @@ tls-key = "./config-key.pem"
         let result = Args::try_parse_from(args);
 
         assert!(result.is_err());
+    }
+
+    fn try_parse(args: &[&str]) -> Result<Args> {
+        let args = std::iter::once("ws2tcp-router")
+            .chain(args.iter().copied())
+            .map(OsString::from);
+        Args::try_parse_from(args)
+    }
+
+    #[test]
+    fn token_options_have_defaults() {
+        let args = parse(&[]);
+
+        assert_eq!(args.access_token_ttl, DEFAULT_ACCESS_TOKEN_TTL);
+        assert_eq!(args.refresh_token_ttl, DEFAULT_REFRESH_TOKEN_TTL);
+        assert_eq!(args.token_secret_file, None);
+    }
+
+    #[test]
+    fn parses_token_options() {
+        let args = parse(&[
+            "--basic-auth",
+            "alice:secret",
+            "--token-secret-file",
+            "./token.key",
+            "--access-token-ttl",
+            "60",
+            "--refresh-token-ttl",
+            "3600",
+        ]);
+
+        assert_eq!(args.token_secret_file, Some(PathBuf::from("./token.key")));
+        assert_eq!(args.access_token_ttl, 60);
+        assert_eq!(args.refresh_token_ttl, 3600);
+    }
+
+    #[test]
+    fn there_is_no_switch_for_token_authentication() {
+        // Basic Auth and tokens are both accepted whenever credentials are configured.
+        assert!(try_parse(&["--basic-auth", "alice:secret", "--token-auth", "optional"]).is_err());
+        assert!(try_parse(&["--token-auth", "required"]).is_err());
+    }
+
+    #[test]
+    fn rejects_zero_token_lifetimes() {
+        assert!(try_parse(&["--access-token-ttl", "0"]).is_err());
+        assert!(try_parse(&["--refresh-token-ttl", "0"]).is_err());
+    }
+
+    #[test]
+    fn trusts_only_loopback_proxies_by_default() {
+        let args = parse(&[]);
+
+        assert_eq!(args.trusted_proxy, IpRange::loopback());
+    }
+
+    #[test]
+    fn parses_trusted_proxies_from_the_command_line() {
+        let args = parse(&[
+            "--trusted-proxy",
+            "10.0.0.0/8",
+            "--trusted-proxy",
+            "2001:db8::1",
+        ]);
+
+        assert_eq!(
+            args.trusted_proxy,
+            vec![
+                "10.0.0.0/8".parse::<IpRange>().unwrap(),
+                "2001:db8::1".parse().unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_an_invalid_trusted_proxy() {
+        assert!(try_parse(&["--trusted-proxy", "nope"]).is_err());
+        assert!(try_parse(&["--trusted-proxy", "10.0.0.0/40"]).is_err());
+    }
+
+    #[test]
+    fn trusted_proxies_come_from_the_config_file_unless_given_on_the_command_line() {
+        let path = temp_path("trusted-proxy");
+        fs::write(&path, "trusted-proxy = [\"172.16.0.0/12\"]\n").unwrap();
+        let config = path.to_str().unwrap();
+
+        let args = parse(&["--config", config]);
+        assert_eq!(args.trusted_proxy, vec!["172.16.0.0/12".parse().unwrap()]);
+
+        let args = parse(&["--config", config, "--trusted-proxy", "192.0.2.1"]);
+        assert_eq!(args.trusted_proxy, vec!["192.0.2.1".parse().unwrap()]);
+
+        // An empty list trusts nobody, so `X-Forwarded-For` is never read.
+        fs::write(&path, "trusted-proxy = []\n").unwrap();
+        assert!(parse(&["--config", config]).trusted_proxy.is_empty());
+
+        fs::write(&path, "trusted-proxy = [\"nope\"]\n").unwrap();
+        assert!(try_parse(&["--config", config]).is_err());
+        fs::remove_file(&path).unwrap();
     }
 }

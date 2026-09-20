@@ -176,6 +176,19 @@ wss://10.15.108.29/tcp:116.63.8.64:12345
                        Basic authentication is enabled. Can be repeated.
 --anonymous-target-file <PATH>
                        Load anonymous upstream targets from a file.
+--trusted-proxy <IP[/PREFIX]>
+                       Believe X-Forwarded-For from connections that come from
+                       this reverse proxy, and log the client address it reports.
+                       An IP address or CIDR range. Can be repeated.
+                       Default: 127.0.0.0/8 and ::1
+--token-secret-file <PATH>
+                       File holding the secret (at least 32 bytes) that signs
+                       access tokens. A random secret is generated at startup
+                       when omitted.
+--access-token-ttl <SECONDS>
+                       Lifetime of an access token. Default: 600
+--refresh-token-ttl <SECONDS>
+                       Lifetime of a refresh token. Default: 604800 (7 days)
 --tls-cert <PATH>      PEM-encoded TLS certificate chain for serving WSS.
 --tls-key <PATH>       PEM-encoded TLS private key for serving WSS.
 --auto-self-signed-cert
@@ -209,6 +222,10 @@ basic-auth = ["alice:secret", "bob:secret2"]
 basic-auth-file = "./users.txt"
 anonymous-target = ["ocs.wangguofang.net:8443"]
 anonymous-target-file = "./anonymous-targets.txt"
+trusted-proxy = ["127.0.0.1", "10.0.0.0/8"]
+token-secret-file = "./token.key"
+access-token-ttl = 600
+refresh-token-ttl = 604800
 tls-cert = "./cert.pem"
 tls-key = "./key.pem"
 auto-self-signed-cert = false
@@ -240,6 +257,11 @@ cargo run -- --bind :: --port 8000 --log-file ./logs/ws2tcp-router.log
 ```
 
 ## HTTP Basic Authentication
+
+> **Kept for compatibility.** Basic Auth on every connection is being phased out in favor of
+> [token authentication](#token-authentication), and is only retained while clients move over
+> (see [Migrating from Basic Auth](#migrating-from-basic-auth)). Basic credentials remain the
+> way to log in for a token for now.
 
 Authentication is disabled unless `--basic-auth` or `--basic-auth-file` is
 specified. When either option is used, every WebSocket upgrade request must
@@ -298,6 +320,343 @@ keeps using the last valid credentials and logs a warning.
 Basic authentication does not encrypt credentials. Use it behind TLS when
 serving untrusted networks.
 
+### Basic Auth flow
+
+With `ws2tcp-local --auth-mode basic` (the compatibility mode), the client checks the gateway
+once at startup, then sends the credentials with every proxied connection:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as App
+    participant C as ws2tcp-local
+    participant R as ws2tcp-router
+    participant U as TCP upstream
+
+    Note over C,R: 1. Health check (once, at startup)
+    C->>R: WebSocket GET / with Authorization Basic
+    alt credentials match
+        R-->>C: 101 Switching Protocols
+        R-->>C: text message ok ws2tcp-router, then close 1000
+        Note over C: the gateway is usable, start listening
+    else missing or wrong credentials
+        R-->>C: 401 Unauthorized with WWW-Authenticate Basic
+        Note over C: print what to fix and exit with status 1
+    end
+
+    Note over A,U: 2. Proxy request (every connection, with the password each time)
+    A->>C: HTTP CONNECT host:port (or SOCKS5)
+    C->>R: WebSocket GET /tcp:host:port with Authorization Basic
+    R->>R: anonymous target, or credentials match?
+    alt allowed
+        R-->>C: 101 Switching Protocols
+        C-->>A: 200 Connection Established
+        R->>U: TCP connect
+        Note over A,U: bytes flow both ways as WebSocket binary frames
+    else refused
+        R-->>C: 401 Unauthorized
+        C-->>A: 502 Bad Gateway
+    end
+```
+
+## Token Authentication
+
+With HTTP Basic authentication alone, the password travels with every WebSocket
+handshake. Token authentication lets a client log in once with Basic Auth and open
+tunnels with a short-lived **access token** instead, renewed with a long-lived
+**refresh token**:
+
+```bash
+cargo run -- --bind 127.0.0.1 --port 8000 --basic-auth alice:secret
+```
+
+Token authentication is always on when Basic authentication (`--basic-auth` or
+`--basic-auth-file`) is configured, because Basic credentials are how clients log in for a
+token. There is no switch: a proxy request may carry either a Bearer access token or Basic
+Auth, and both are accepted side by side. Basic Auth is kept for compatibility while clients
+move to tokens. Without any credentials, authentication is off altogether and there are no
+token endpoints.
+
+The router does not check whether a connection is encrypted, so token authentication
+works on the plain `ws://` listener and behind a reverse proxy that terminates TLS
+(see [Behind a Reverse Proxy](#behind-a-reverse-proxy)). Over any unencrypted hop a token can be sniffed, just
+like a Basic Auth header, and a refresh token is worth more than a password because
+it keeps working: encrypt every hop that crosses an untrusted network.
+
+### Overview
+
+With `ws2tcp-local`'s default `token` mode, a client requests a token once and opens each tunnel
+with the access token. It renews the access token with the refresh token on its own, in the
+background, before it runs out: the application that uses the proxy takes no part in it and
+does not notice. There is no fallback to Basic Auth.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as App
+    participant C as ws2tcp-local
+    participant R as ws2tcp-router
+    participant U as TCP upstream
+
+    Note over C,R: 1. Request the token (once, at startup)
+    C->>R: POST /auth/token with Authorization Basic
+    alt credentials match
+        R-->>C: 200 access_token, refresh_token, expires_in, refresh_expires_in
+        Note over C: keep both tokens, the access token is due after 80 percent of expires_in
+    else wrong credentials
+        R-->>C: 401 Unauthorized
+        Note over C: print what to fix and exit with status 1
+    else no token endpoints, or the gateway is unreachable
+        R-->>C: 404 Not Found, or no answer
+        Note over C: print the reason and exit with status 1, there is no fallback to Basic Auth
+    end
+
+    Note over A,U: 2. Proxy request (every connection, no password)
+    A->>C: HTTP CONNECT host:port (or SOCKS5)
+    C->>R: WebSocket GET /tcp:host:port with Authorization Bearer access_token
+    R->>R: signature, expiry, login not revoked, user still exists?
+    alt valid
+        R-->>C: 101 Switching Protocols
+        C-->>A: 200 Connection Established
+        R->>U: TCP connect
+        Note over A,U: bytes flow both ways as WebSocket binary frames
+    else invalid
+        R-->>C: 401 Unauthorized with WWW-Authenticate Bearer
+        Note over C: renew the tokens and try once more, as in step 3
+    end
+
+    loop Every time 80 percent of the access token lifetime is used, in the background
+        Note over C,R: 3. Refresh the access token (ws2tcp-local alone, no App and no tunnel needed)
+        C->>R: POST /auth/refresh with Authorization Bearer refresh_token
+        alt the refresh_token is the current one
+            R-->>C: 200 new access_token and new refresh_token, the old refresh_token is spent
+        else refused: expired, already used, revoked, or the router restarted
+            R-->>C: 401 invalid_token
+            C->>R: POST /auth/token with Authorization Basic
+            R-->>C: 200 a new login
+        end
+    end
+```
+
+### Migrating from Basic Auth
+
+Basic Auth on tunnels is being phased out, and this is a gradual rollout: both methods work
+side by side, and there is no setting to choose between them.
+
+```mermaid
+flowchart LR
+    P0["Before token support<br/>Basic only"] --> P1["Gray period (now)<br/>Basic and tokens both accepted<br/>ws2tcp-local defaults to token<br/>--auth-mode basic for older routers"]
+    P1 --> P2["Planned, a later release<br/>Basic Auth on tunnels removed"]
+```
+
+1. **Now, the gray period.** A router with Basic credentials accepts both. `ws2tcp-local`
+   defaults to `--auth-mode token`, so it uses tokens; `--auth-mode basic` keeps the old
+   behavior, for a router that has no token authentication (an older `ws2tcp-router`) and
+   for clients that have not been updated. Both kinds of client work against this router.
+2. **Later:** once no client uses Basic Auth any more, a later release removes Basic Auth on
+   tunnels. Logging in for a token still takes the credentials (`--basic-auth` /
+   `--basic-auth-file`) for now.
+
+Until then Basic Auth cannot be switched off by configuration, and the router does not yet
+log which method a connection used, so it cannot tell you when the last Basic client is gone.
+
+### Endpoints
+
+All three are plain HTTP `POST` requests with no body; the credential is in the
+`Authorization` header.
+
+| Request | Credential | Result |
+| --- | --- | --- |
+| `POST /auth/token` | `Basic <user:pass>` | a new access + refresh token |
+| `POST /auth/refresh` | `Bearer <refresh token>` | a new pair; the presented refresh token is void |
+| `POST /auth/revoke` | `Bearer <refresh token>` | logs out; `204 No Content` |
+
+```bash
+curl -sk -X POST -u alice:secret https://10.15.108.29/auth/token
+```
+
+```json
+{"token_type":"Bearer","access_token":"...","expires_in":600,
+ "refresh_token":"...","refresh_expires_in":604800}
+```
+
+Then open tunnels with the access token, in the header of the WebSocket handshake:
+
+```text
+Authorization: Bearer <access_token>
+```
+
+A rejected token gets `401 Unauthorized` with a `WWW-Authenticate: Bearer` challenge
+(and `error="invalid_token"` when a token was presented).
+
+### How a request is authorized
+
+This is the decision for a WebSocket handshake, and for the plain `GET /` health
+check (the `/auth/*` endpoints check their own credential, see the table above):
+
+```mermaid
+flowchart TD
+    A["WebSocket handshake or GET /"] --> B{"Basic auth enabled?"}
+    B -- no --> OK1["Allow as anonymous"]
+    B -- yes --> C{"Anonymous target?"}
+    C -- yes --> OK1
+    C -- no --> D{"Authorization header"}
+    D -- missing --> X["401 with the challenges"]
+    D -- "Bearer" --> E{"Valid access token?<br/>signature, expiry, login not revoked,<br/>user still in the credentials"}
+    E -- yes --> OK2["Allow as the token's user"]
+    E -- no --> X
+    D -- "Basic" --> G{"Credentials match?"}
+    G -- yes --> OK2
+    G -- no --> X
+```
+
+The `401` offers both a `Basic` and a `Bearer` challenge.
+
+### Token lifetimes
+
+Each refresh token moves through these states:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Active: issued by /auth/token or /auth/refresh
+    Active --> Spent: presented to /auth/refresh, a new token replaces it
+    Active --> Revoked: /auth/revoke, or its login revoked by reuse detection
+    Active --> Expired: refresh-token-ttl, or 30 days after the login
+    Spent --> Revoked: presented again, so it leaked and the whole login is revoked
+    Spent --> Expired: the time it would have expired
+    Revoked --> [*]
+    Expired --> [*]
+```
+
+And this is how a client renews, or recovers when the router no longer knows its
+refresh token:
+
+```mermaid
+sequenceDiagram
+    participant C as ws2tcp-local
+    participant R as ws2tcp-router
+
+    Note over C: the access token has used 80 percent of its lifetime
+    C->>R: POST /auth/refresh with Bearer refresh_1
+    alt refresh_1 is the current refresh token
+        R-->>C: 200 access_2 and refresh_2, refresh_1 is now spent
+    else refresh_1 was already used, it leaked or a response was lost
+        R->>R: revoke the whole login
+        R-->>C: 401 invalid_token
+        C->>R: POST /auth/token with Basic Auth
+        R-->>C: 200 a new login
+    else refresh_1 is unknown, expired or revoked, for example after a router restart
+        R-->>C: 401 invalid_token
+        C->>R: POST /auth/token with Basic Auth
+        R-->>C: 200 a new login
+    end
+    Note over C,R: A tunnel request answered 401 triggers the same renewal, then is tried once more
+```
+
+### How it behaves
+
+- An **access token** is stateless and signed (HMAC-SHA256). The server keeps nothing
+  per access token, only checking the signature, the expiry, that its login was not
+  revoked, and that its user still exists. Removing a user from the credentials
+  therefore ends their tokens (access tokens within their remaining lifetime, refresh
+  tokens at once).
+- A **refresh token** is random, opaque and single-use: each refresh returns a new one
+  and voids the old one. Only its SHA-256 is stored. Presenting one that was already
+  used means it leaked, so the whole login (its refresh token and, until they expire,
+  its access tokens) is revoked and the client has to log in again with Basic Auth.
+  A refresh token also stops working 30 days after the login however often it is
+  renewed.
+- Tunnels that are already open are not closed when their access token expires or is
+  revoked: the token is checked at the handshake only.
+- Refresh tokens live in memory. After a restart they are gone and clients log in
+  again with Basic Auth (`ws2tcp-local` does this by itself). Access tokens survive
+  a restart only when `--token-secret-file` is set; without it a random secret is
+  generated each time. Run one router per secret file: refresh tokens are not shared
+  between instances.
+- `ws2tcp-local --auth-mode token` (through `ws2tcp-local-core`) logs in at startup, renews
+  the access token before it runs out, logs in again when the router
+  forgot its refresh token, and never falls back to Basic Auth. With
+  `--auth-mode basic` it does not use tokens at all. Clients without token support keep
+  working: Basic Auth is still accepted.
+
+There is no rate limiting on login attempts yet, on the token endpoints or on the
+WebSocket handshake alike.
+
+### Internals
+
+```mermaid
+classDiagram
+    class AuthConfig {
+        +basic_user(authorization) Option~String~
+        +has_user(user) bool
+        +tokens() Option~TokenService~
+    }
+    class TokenService {
+        +login(user) IssuedTokens
+        +refresh(refresh_token, user_exists) IssuedTokens
+        +revoke(refresh_token) bool
+        +verify_access(access_token) Option~String~
+    }
+    class State {
+        refresh: Map~Hash, RefreshRecord~
+        spent: Map~Hash, SpentRecord~
+        revoked: Map~family, Instant~
+    }
+    class RefreshRecord {
+        family
+        user
+        expires
+        family_deadline
+    }
+    class SpentRecord {
+        family
+        user
+        expires
+    }
+    class IssuedTokens {
+        access_token
+        access_expires_in
+        refresh_token
+        refresh_expires_in
+    }
+    class TrustedProxies {
+        +client_addr(peer, head) ClientAddr
+    }
+    class IpRange {
+        +contains(ip) bool
+    }
+    class ClientAddr {
+        peer
+        forwarded
+    }
+    class auth {
+        <<module>>
+        authorize_request(request, auth, client)
+    }
+    class token_api {
+        <<module>>
+        handle_auth_request(request, auth, client)
+    }
+    class proxy {
+        <<module>>
+        handle_connection(stream, peer_addr, ...)
+    }
+    AuthConfig o-- TokenService : Basic auth is configured
+    TokenService *-- State : behind a Mutex
+    State *-- RefreshRecord
+    State *-- SpentRecord
+    TokenService ..> IssuedTokens : creates
+    TrustedProxies o-- IpRange
+    TrustedProxies ..> ClientAddr : creates
+    proxy ..> TrustedProxies : once per connection
+    proxy ..> auth : handshake and health check
+    auth ..> ClientAddr : for the logs
+    token_api ..> ClientAddr : for the logs
+    proxy ..> token_api : /auth/*
+    auth ..> AuthConfig
+    token_api ..> AuthConfig
+```
+
 ## TLS / WSS
 
 TLS is disabled by default. Configure both `--tls-cert` and `--tls-key` to serve
@@ -326,6 +685,99 @@ Run both WS and WSS listeners at the same time:
 ```bash
 cargo run -- --service-mode both --port 80 --tls-port 443 --auto-self-signed-cert
 ```
+
+## Behind a Reverse Proxy
+
+The router can sit behind a reverse proxy such as nginx that terminates TLS and speaks
+plain `ws://` to the router:
+
+```mermaid
+flowchart LR
+    C["ws2tcp-local"] -- "wss and https (TLS)" --> N["nginx<br/>terminates TLS<br/>strips /tunnel"]
+    N -- "ws and http (plain, trusted network)" --> R["ws2tcp-router<br/>--port 8000"]
+    R -- "TCP or UDP" --> U["upstream"]
+```
+
+```nginx
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+server {
+    listen 443 ssl;
+    server_name wangguofang.net;
+    # ssl_certificate and ssl_certificate_key go here
+
+    location /tunnel/ {
+        proxy_pass http://127.0.0.1:8000/;   # the trailing slash strips /tunnel
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_read_timeout 1h;               # the default of 60 s closes idle tunnels
+    }
+}
+```
+
+The gateway is then `wss://wangguofang.net/tunnel`. The proxy has to forward the
+WebSocket upgrade **and** the plain HTTP requests under the same path prefix: the
+health check (`GET /tunnel/`) and, with [token authentication](#token-authentication),
+`POST /tunnel/auth/token` and `POST /tunnel/auth/refresh`, which the router receives as
+`POST /auth/token` and so on. The `Authorization` header is passed through.
+
+### Client addresses
+
+Every connection arrives from the proxy, so without help the logs would show the proxy's
+address for every client. The router reads the client's address from `X-Forwarded-For`
+(nginx does not send it unless it is told to, as in the `proxy_set_header` line above),
+and logs it in the `peer_addr` field of the log lines about that connection:
+
+```text
+DEBUG http health check peer_addr=203.0.113.7 auth_user=alice user_agent=ws2tcp-local/0.1.20
+```
+
+Any client can send an `X-Forwarded-For` header of its own, so the router believes it
+**only when the connection comes from a trusted proxy**, and then only what the trusted
+proxies wrote: it reads the entries from the right, skips the addresses of trusted
+proxies, and takes the first other address as the client. Entries that the client put
+to the left of that cannot change the outcome.
+
+```mermaid
+flowchart TD
+    A["Request head read"] --> B{"Peer in a trusted proxy range?"}
+    B -- no --> P["Log the peer socket address<br/>X-Forwarded-For is ignored"]
+    B -- yes --> C{"Complete request with an<br/>X-Forwarded-For header?"}
+    C -- no --> P
+    C -- yes --> D["Next entry, from the right"]
+    D --> E{"Is it an IP address?"}
+    E -- no --> P
+    E -- yes --> F{"Is it a trusted proxy?"}
+    F -- no --> I["Log this address as the client"]
+    F -- yes --> G{"Any entry left of it?"}
+    G -- yes --> D
+    G -- no --> H["Every entry is a proxy:<br/>log the leftmost one"]
+```
+
+With `--trusted-proxy` (an IP address or a CIDR range such as `10.0.0.0/8`; repeat it for
+several) you say which proxies are trusted. The default is the loopback addresses
+(`127.0.0.0/8` and `::1`), which covers an nginx on the same host without any
+configuration; for an nginx on another host or in another container, name its address.
+Giving `--trusted-proxy` replaces the default, and `trusted-proxy = []` in the
+configuration file trusts nobody, so the header is never read. The trusted proxies are
+logged at startup.
+
+Notes:
+
+- Only the logs use the address. Nothing else in the router depends on where a client
+  comes from.
+- A client address from `X-Forwarded-For` has no port, so it is logged without one
+  (`203.0.113.7`); a connection that is not from a trusted proxy is logged as before
+  (`127.0.0.1:43026`). The addresses in a header may carry a port or IPv6 brackets;
+  IPv4-mapped IPv6 addresses are logged as IPv4.
+- The `connection closed with error` line is written without having read a request, so
+  it still shows the address of whoever connected: the proxy.
 
 ## Path Format
 
@@ -377,18 +829,15 @@ The text message looks like this:
 ok: ws2tcp-router 0.1.17 is available; health check only, no upstream connected
 ```
 
-Each successful health check, in either form, also returns a freshly generated
-random token in the `X-Ws2tcp-Token` response header (on the `101` handshake
-response for WebSocket, and on the `200` response for HTTP). Clients are expected
-to send it back in the `X-Ws2tcp-Token` request header on their proxy requests,
-next to the Basic Auth credentials. **The token is not verified yet**: the server
-neither remembers nor checks it and ignores the header on proxy requests, so
-authentication is still Basic Auth only. Verification is planned for a later
-version.
+The health check hands out nothing else. Earlier versions returned an unverified
+`X-Ws2tcp-Token` header; it was replaced by the real
+[token authentication](#token-authentication) below, and clients that still send
+that header are simply ignored.
 
 When Basic Auth is enabled, the health check still requires valid credentials,
 because `/` is not an anonymous target: without them, both forms fail with
-`401 Unauthorized`.
+`401 Unauthorized`. It accepts Basic Auth as well as access tokens, so clients in `basic`
+mode and monitoring probes keep working.
 
 A WebSocket request with a path that is not `/`, `/tcp:` or `/udp:` is rejected
 with `400 Bad Request` and a body explaining the expected path format. Plain

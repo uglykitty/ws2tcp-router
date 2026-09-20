@@ -15,6 +15,20 @@ udp-idle-timeout = 60
 # anonymous-target = ["ocs.wangguofang.net:8443"]
 # anonymous-target-file = "./anonymous-targets.txt"
 
+# Reverse proxies (IP addresses or CIDR ranges) whose X-Forwarded-For header is believed, so
+# that the logs show the real client address. Default: ["127.0.0.0/8", "::1/128"], which covers
+# an nginx on the same host. An empty list trusts nobody.
+# trusted-proxy = ["127.0.0.1", "10.0.0.0/8"]
+
+# Access/refresh token authentication is always on when Basic authentication is configured
+# (Basic credentials are how clients log in for a token): a proxy request may carry a Bearer
+# access token or, kept for compatibility while clients move over, Basic Auth. The router does
+# not check that the connection is encrypted: serve over TLS, at the router or at a reverse
+# proxy.
+# token-secret-file = "./token.key"   # at least 32 bytes; random per start when omitted
+# access-token-ttl = 600
+# refresh-token-ttl = 604800
+
 # Configure both TLS fields to serve WSS.
 # tls-cert = "./cert.pem"
 # tls-key = "./key.pem"

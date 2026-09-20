@@ -16,7 +16,7 @@ use tokio_tungstenite::{
     tungstenite::{
         Message,
         handshake::server::{ErrorResponse, Request, Response},
-        http::{HeaderValue, Method, StatusCode, header},
+        http::{Method, StatusCode, header},
         protocol::{CloseFrame, frame::coding::CloseCode},
     },
 };
@@ -24,12 +24,12 @@ use tracing::{debug, info, warn};
 
 use crate::{
     auth::{AuthConfig, authorize_request},
+    client_addr::{ClientAddr, TrustedProxies},
     http_probe::{
-        ReplayStream, health_check_response, parse_plain_health_check, read_request_head,
-        write_response,
+        ReplayStream, health_check_response, parse_plain_request, read_request_head, write_response,
     },
     target::{Protocol, Target, parse_target},
-    token::{TOKEN_HEADER, generate_token},
+    token_api::handle_auth_request,
 };
 
 // Large enough for the maximum possible UDP payload (65507 bytes over IPv4/IPv6).
@@ -38,7 +38,7 @@ const UDP_DATAGRAM_BUFFER: usize = 65536;
 // A request to this path only checks that the service is reachable (and that the caller passes
 // authentication), with no upstream. A websocket request completes the handshake, receives a text
 // message and is closed; a plain HTTP request gets a `200 OK` with the same message as its body.
-const HEALTH_CHECK_PATH: &str = "/";
+pub const HEALTH_CHECK_PATH: &str = "/";
 const HEALTH_CHECK_MESSAGE: &str = concat!(
     "ok: ws2tcp-router ",
     env!("CARGO_PKG_VERSION"),
@@ -58,6 +58,7 @@ pub async fn handle_connection<S>(
     buffer_size: usize,
     auth: Option<Arc<AuthConfig>>,
     udp_idle_timeout: Duration,
+    trusted_proxies: Arc<TrustedProxies>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -65,17 +66,21 @@ where
     let head = read_request_head(&mut stream)
         .await
         .context("read http request failed")?;
-    if let Some(request) = parse_plain_health_check(&head) {
-        let user_agent = request_user_agent(&request);
-        let response = match authorize_request(&request, auth.as_deref(), peer_addr) {
-            Ok(auth_user) => {
-                debug!(%peer_addr, auth_user = %auth_user, %user_agent, "http health check");
-                match generate_token() {
-                    Ok(token) => health_check_response(HEALTH_CHECK_MESSAGE, &token),
-                    Err(err) => token_error_response(&err),
+    // From here on the connection is reported under the client's address: behind a trusted
+    // reverse proxy that is the one in `X-Forwarded-For`, not the proxy's.
+    let peer_addr = trusted_proxies.client_addr(peer_addr, &head);
+    if let Some(request) = parse_plain_request(&head) {
+        let response = if request.uri().path() == HEALTH_CHECK_PATH {
+            let user_agent = request_user_agent(&request);
+            match authorize_request(&request, auth.as_deref(), peer_addr) {
+                Ok(auth_user) => {
+                    debug!(%peer_addr, auth_user = %auth_user, %user_agent, "http health check");
+                    health_check_response(HEALTH_CHECK_MESSAGE)
                 }
+                Err(response) => response,
             }
-            Err(response) => response,
+        } else {
+            handle_auth_request(&request, auth.as_deref(), peer_addr)
         };
         // The client may already be gone; there is nothing more to do either way.
         let _ = write_response(&mut stream, &response, request.method() != Method::HEAD).await;
@@ -191,28 +196,15 @@ pub fn request_user_agent(request: &Request) -> String {
         .to_owned()
 }
 
-fn token_error_response(err: &anyhow::Error) -> ErrorResponse {
-    warn!(error = %err, "failed to generate health check token");
-    let mut response = ErrorResponse::new(Some("failed to generate token".to_owned()));
-    *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-    response
-}
-
 #[allow(clippy::result_large_err)]
 fn capture_requested_target(
     request: &Request,
     response: Response,
     target_slot: &Arc<Mutex<Option<Route>>>,
-    peer_addr: SocketAddr,
+    peer_addr: ClientAddr,
     auth_user: &str,
 ) -> std::result::Result<Response, ErrorResponse> {
     if request.uri().path() == HEALTH_CHECK_PATH {
-        let token = generate_token().map_err(|err| token_error_response(&err))?;
-        let mut response = response;
-        response.headers_mut().insert(
-            TOKEN_HEADER,
-            HeaderValue::from_str(&token).expect("token is base64url, a valid header value"),
-        );
         *target_slot.lock().expect("target mutex poisoned") = Some(Route::HealthCheck);
         return Ok(response);
     }
@@ -367,10 +359,21 @@ mod tests {
     };
 
     use super::*;
+    use crate::{client_addr::IpRange, token::TokenService};
+    use tokio_tungstenite::tungstenite::http::HeaderValue;
 
     fn spawn_server_with_auth(
         stream: tokio::io::DuplexStream,
         auth: Option<Arc<AuthConfig>>,
+    ) -> tokio::task::JoinHandle<Result<()>> {
+        spawn_server_behind(stream, auth, TrustedProxies::new(IpRange::loopback()))
+    }
+
+    /// Serves a connection that arrives from 127.0.0.1, with the given proxies trusted.
+    fn spawn_server_behind(
+        stream: tokio::io::DuplexStream,
+        auth: Option<Arc<AuthConfig>>,
+        trusted_proxies: TrustedProxies,
     ) -> tokio::task::JoinHandle<Result<()>> {
         let peer_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
         tokio::spawn(handle_connection(
@@ -379,6 +382,7 @@ mod tests {
             1024,
             auth,
             Duration::from_secs(1),
+            Arc::new(trusted_proxies),
         ))
     }
 
@@ -397,12 +401,6 @@ mod tests {
         (response, server.await.unwrap())
     }
 
-    fn token_header(response: &str) -> Option<&str> {
-        response
-            .lines()
-            .find_map(|line| line.strip_prefix("x-ws2tcp-token: "))
-    }
-
     #[tokio::test]
     async fn root_path_health_check_completes_handshake_and_closes() {
         let (client_stream, server_stream) = duplex(4096);
@@ -412,13 +410,7 @@ mod tests {
             .await
             .expect("health check handshake should succeed");
         assert_eq!(response.status(), 101);
-        let token = response
-            .headers()
-            .get(TOKEN_HEADER)
-            .expect("handshake response carries a token")
-            .to_str()
-            .unwrap();
-        assert_eq!(token.len(), 43);
+        assert!(response.headers().get("x-ws2tcp-token").is_none());
 
         match client.next().await {
             Some(Ok(Message::Text(text))) => assert_eq!(text.as_str(), HEALTH_CHECK_MESSAGE),
@@ -455,49 +447,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proxy_request_ignores_the_token_header() {
-        // A TCP upstream that echoes what it receives.
-        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream_addr = upstream.local_addr().unwrap();
-        tokio::spawn(async move {
-            let (mut socket, _) = upstream.accept().await.unwrap();
-            let mut buffer = [0_u8; 64];
-            let n = socket.read(&mut buffer).await.unwrap();
-            socket.write_all(&buffer[..n]).await.unwrap();
-        });
-
-        let (client_stream, server_stream) = duplex(4096);
-        let auth = Arc::new(AuthConfig::with_basic_auth_for_test("alice:secret"));
-        let _server = spawn_server_with_auth(server_stream, Some(auth));
-
-        // Basic Auth decides; the token is neither required nor checked, so any value passes.
-        let mut request = format!("ws://localhost/tcp:{upstream_addr}")
-            .into_client_request()
-            .unwrap();
-        request.headers_mut().insert(
-            header::AUTHORIZATION,
-            HeaderValue::from_static("Basic YWxpY2U6c2VjcmV0"), // alice:secret
-        );
-        request
-            .headers_mut()
-            .insert(TOKEN_HEADER, HeaderValue::from_static("not-a-real-token"));
-
-        let (mut client, response) = client_async(request, client_stream)
-            .await
-            .expect("token header must not affect the handshake");
-        assert_eq!(response.status(), 101);
-
-        client
-            .send(Message::Binary(b"ping".to_vec().into()))
-            .await
-            .unwrap();
-        match client.next().await {
-            Some(Ok(Message::Binary(bytes))) => assert_eq!(&bytes[..], b"ping"),
-            other => panic!("expected echoed bytes, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
     async fn plain_http_get_root_returns_health_check_message() {
         let (response, result) = raw_exchange(
             "GET / HTTP/1.1\r\nHost: x\r\nUser-Agent: probe/1.0\r\n\r\n",
@@ -512,42 +461,8 @@ mod tests {
             HEALTH_CHECK_MESSAGE.len()
         )));
         assert!(response.ends_with(HEALTH_CHECK_MESSAGE), "{response}");
-        assert_eq!(
-            token_header(&response).map(str::len),
-            Some(43),
-            "{response}"
-        );
+        assert!(!response.contains("x-ws2tcp-token"), "{response}");
         result.expect("http health check should not error");
-    }
-
-    #[tokio::test]
-    async fn every_health_check_gets_a_new_token() {
-        let request = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
-        let (first, _) = raw_exchange(request, None).await;
-        let (second, _) = raw_exchange(request, None).await;
-
-        let (first, second) = (
-            token_header(&first).unwrap(),
-            token_header(&second).unwrap(),
-        );
-        assert_ne!(first, second);
-    }
-
-    #[tokio::test]
-    async fn token_is_not_used_for_authentication_yet() {
-        let auth = Arc::new(AuthConfig::with_basic_auth_for_test("alice:secret"));
-        // A token, but no credentials: still rejected, and no new token is handed out.
-        let (response, _) = raw_exchange(
-            "GET / HTTP/1.1\r\nHost: x\r\nX-Ws2tcp-Token: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n\r\n",
-            Some(auth),
-        )
-        .await;
-
-        assert!(
-            response.starts_with("HTTP/1.1 401 Unauthorized\r\n"),
-            "{response}"
-        );
-        assert_eq!(token_header(&response), None, "{response}");
     }
 
     #[tokio::test]
@@ -580,5 +495,452 @@ mod tests {
         .await;
         assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
         result.expect("authorized http health check should not error");
+    }
+
+    const ALICE: &str = "Basic YWxpY2U6c2VjcmV0"; // alice:secret
+    const WRONG: &str = "Basic YWxpY2U6d3Jvbmc="; // alice:wrong
+
+    fn token_auth() -> Arc<AuthConfig> {
+        let tokens = TokenService::new(
+            b"0123456789abcdef0123456789abcdef",
+            Duration::from_secs(600),
+            Duration::from_secs(3600),
+        );
+        Arc::new(AuthConfig::with_tokens_for_test("alice:secret", tokens))
+    }
+
+    fn post(path: &str, authorization: Option<&str>) -> String {
+        let authorization = authorization
+            .map(|value| format!("Authorization: {value}\r\n"))
+            .unwrap_or_default();
+        format!("POST {path} HTTP/1.1\r\nHost: x\r\n{authorization}Content-Length: 0\r\n\r\n")
+    }
+
+    fn json_field(response: &str, name: &str) -> String {
+        let marker = format!("\"{name}\":\"");
+        let start = response.find(&marker).expect("field in response") + marker.len();
+        response[start..]
+            .split('"')
+            .next()
+            .expect("closing quote")
+            .to_owned()
+    }
+
+    /// Logs in with Basic Auth and returns `(access_token, refresh_token)`.
+    async fn login(auth: &Arc<AuthConfig>) -> (String, String) {
+        let (response, result) =
+            raw_exchange(&post("/auth/token", Some(ALICE)), Some(Arc::clone(auth))).await;
+        result.expect("login should not error");
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+        (
+            json_field(&response, "access_token"),
+            json_field(&response, "refresh_token"),
+        )
+    }
+
+    /// Tries a websocket handshake and returns the client on success, or the rejection status.
+    async fn ws_handshake(
+        auth: &Arc<AuthConfig>,
+        target: &str,
+        authorization: Option<&str>,
+    ) -> Result<tokio_tungstenite::WebSocketStream<tokio::io::DuplexStream>, StatusCode> {
+        let (client_stream, server_stream) = duplex(4096);
+        let _server = spawn_server_with_auth(server_stream, Some(Arc::clone(auth)));
+
+        let mut request = format!("ws://localhost{target}")
+            .into_client_request()
+            .unwrap();
+        if let Some(authorization) = authorization {
+            request.headers_mut().insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_str(authorization).unwrap(),
+            );
+        }
+        match client_async(request, client_stream).await {
+            Ok((client, _)) => Ok(client),
+            Err(WsError::Http(response)) => Err(response.status()),
+            Err(other) => panic!("unexpected handshake error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn token_endpoints_do_not_exist_without_a_token_service() {
+        for auth in [
+            None,
+            Some(Arc::new(AuthConfig::with_basic_auth_for_test(
+                "alice:secret",
+            ))),
+        ] {
+            let (response, _) = raw_exchange(&post("/auth/token", Some(ALICE)), auth).await;
+            assert!(
+                response.starts_with("HTTP/1.1 404 Not Found\r\n"),
+                "{response}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn login_needs_valid_basic_credentials() {
+        let auth = token_auth();
+
+        for authorization in [None, Some(WRONG)] {
+            let (response, _) =
+                raw_exchange(&post("/auth/token", authorization), Some(Arc::clone(&auth))).await;
+            assert!(
+                response.starts_with("HTTP/1.1 401 Unauthorized\r\n"),
+                "{response}"
+            );
+            assert!(response.contains("www-authenticate: Basic realm=\"ws2tcp-router\""));
+            assert!(!response.contains("access_token"), "{response}");
+        }
+
+        let (response, _) = raw_exchange(&post("/auth/token", Some(ALICE)), Some(auth)).await;
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+        assert!(response.contains("content-type: application/json\r\n"));
+        assert!(response.contains("cache-control: no-store\r\n"));
+        assert!(response.contains("\"token_type\":\"Bearer\""), "{response}");
+        assert!(response.contains("\"expires_in\":600"), "{response}");
+        assert!(
+            response.contains("\"refresh_expires_in\":3600"),
+            "{response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn token_endpoints_accept_only_post_without_a_body() {
+        let auth = token_auth();
+
+        let (response, _) = raw_exchange(
+            &format!("GET /auth/token HTTP/1.1\r\nHost: x\r\nAuthorization: {ALICE}\r\n\r\n"),
+            Some(Arc::clone(&auth)),
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"),
+            "{response}"
+        );
+        assert!(response.contains("allow: POST\r\n"), "{response}");
+
+        let (response, _) = raw_exchange(
+            &format!(
+                "POST /auth/token HTTP/1.1\r\nHost: x\r\nAuthorization: {ALICE}\r\nContent-Length: 5\r\n\r\nhello"
+            ),
+            Some(Arc::clone(&auth)),
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+            "{response}"
+        );
+
+        let (response, _) = raw_exchange(&post("/auth/nope", Some(ALICE)), Some(auth)).await;
+        assert!(
+            response.starts_with("HTTP/1.1 404 Not Found\r\n"),
+            "{response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn access_token_authorizes_a_proxy_request() {
+        // A TCP upstream that echoes what it receives.
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = upstream.accept().await.unwrap();
+            let mut buffer = [0_u8; 64];
+            let n = socket.read(&mut buffer).await.unwrap();
+            socket.write_all(&buffer[..n]).await.unwrap();
+        });
+
+        let auth = token_auth();
+        let (access, _) = login(&auth).await;
+
+        let mut client = ws_handshake(
+            &auth,
+            &format!("/tcp:{upstream_addr}"),
+            Some(&format!("Bearer {access}")),
+        )
+        .await
+        .expect("a valid access token should pass the handshake");
+
+        client
+            .send(Message::Binary(b"ping".to_vec().into()))
+            .await
+            .unwrap();
+        match client.next().await {
+            Some(Ok(Message::Binary(bytes))) => assert_eq!(&bytes[..], b"ping"),
+            other => panic!("expected echoed bytes, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_access_tokens_are_rejected_with_a_bearer_challenge() {
+        let auth = token_auth();
+        let (_, refresh) = login(&auth).await;
+
+        // A refresh token is not an access token, and garbage is not a token.
+        for authorization in [
+            format!("Bearer {refresh}"),
+            "Bearer garbage".to_owned(),
+            "Bearer ".to_owned(),
+        ] {
+            let (client_stream, server_stream) = duplex(4096);
+            let _server = spawn_server_with_auth(server_stream, Some(Arc::clone(&auth)));
+            let mut request = "ws://localhost/tcp:127.0.0.1:9"
+                .into_client_request()
+                .unwrap();
+            request.headers_mut().insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_str(&authorization).unwrap(),
+            );
+            match client_async(request, client_stream).await {
+                Err(WsError::Http(response)) => {
+                    assert_eq!(
+                        response.status(),
+                        StatusCode::UNAUTHORIZED,
+                        "{authorization}"
+                    );
+                    let challenges: Vec<_> = response
+                        .headers()
+                        .get_all(header::WWW_AUTHENTICATE)
+                        .iter()
+                        .map(|value| value.to_str().unwrap().to_owned())
+                        .collect();
+                    assert!(
+                        challenges.iter().any(|c| c.starts_with("Basic ")),
+                        "{challenges:?}"
+                    );
+                    assert!(
+                        challenges.iter().any(|c| c.starts_with("Bearer ")),
+                        "{challenges:?}"
+                    );
+                }
+                other => panic!("expected 401, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_rotates_tokens_and_detects_reuse() {
+        let auth = token_auth();
+        let (access1, refresh1) = login(&auth).await;
+
+        let (response, _) = raw_exchange(
+            &post("/auth/refresh", Some(&format!("Bearer {refresh1}"))),
+            Some(Arc::clone(&auth)),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+        let access2 = json_field(&response, "access_token");
+        let refresh2 = json_field(&response, "refresh_token");
+        assert_ne!(refresh1, refresh2);
+        ws_handshake(&auth, "/", Some(&format!("Bearer {access2}")))
+            .await
+            .expect("the new access token works");
+
+        // Presenting the rotated-out token again means it leaked: everything is revoked.
+        let (response, _) = raw_exchange(
+            &post("/auth/refresh", Some(&format!("Bearer {refresh1}"))),
+            Some(Arc::clone(&auth)),
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 401 Unauthorized\r\n"),
+            "{response}"
+        );
+        assert!(response.contains("error=\"invalid_token\""), "{response}");
+
+        let (response, _) = raw_exchange(
+            &post("/auth/refresh", Some(&format!("Bearer {refresh2}"))),
+            Some(Arc::clone(&auth)),
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 401 Unauthorized\r\n"),
+            "{response}"
+        );
+        for access in [access1, access2] {
+            let status = ws_handshake(&auth, "/", Some(&format!("Bearer {access}")))
+                .await
+                .err();
+            assert_eq!(status, Some(StatusCode::UNAUTHORIZED));
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_and_revoke_need_a_bearer_credential() {
+        let auth = token_auth();
+        let (access, _) = login(&auth).await;
+
+        for path in ["/auth/refresh", "/auth/revoke"] {
+            // Nothing, Basic Auth, and an access token are none of them a refresh token.
+            for authorization in [
+                None,
+                Some(ALICE.to_owned()),
+                Some(format!("Bearer {access}")),
+            ] {
+                let (response, _) = raw_exchange(
+                    &post(path, authorization.as_deref()),
+                    Some(Arc::clone(&auth)),
+                )
+                .await;
+                if path == "/auth/revoke" && authorization.is_some_and(|a| a.starts_with("Bearer"))
+                {
+                    // Revoking is answered the same for unknown tokens.
+                    assert!(
+                        response.starts_with("HTTP/1.1 204 No Content\r\n"),
+                        "{response}"
+                    );
+                    assert!(!response.contains("content-length"), "{response}");
+                } else {
+                    assert!(
+                        response.starts_with("HTTP/1.1 401 Unauthorized\r\n"),
+                        "{path}: {response}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn revoke_logs_the_client_out() {
+        let auth = token_auth();
+        let (access, refresh) = login(&auth).await;
+        ws_handshake(&auth, "/", Some(&format!("Bearer {access}")))
+            .await
+            .expect("access token works before logout");
+
+        let (response, _) = raw_exchange(
+            &post("/auth/revoke", Some(&format!("Bearer {refresh}"))),
+            Some(Arc::clone(&auth)),
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 204 No Content\r\n"),
+            "{response}"
+        );
+
+        let status = ws_handshake(&auth, "/", Some(&format!("Bearer {access}")))
+            .await
+            .err();
+        assert_eq!(status, Some(StatusCode::UNAUTHORIZED));
+        let (response, _) = raw_exchange(
+            &post("/auth/refresh", Some(&format!("Bearer {refresh}"))),
+            Some(auth),
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 401 Unauthorized\r\n"),
+            "{response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn basic_auth_is_still_accepted_next_to_tokens() {
+        let auth = token_auth();
+
+        ws_handshake(&auth, "/tcp:127.0.0.1:9", Some(ALICE))
+            .await
+            .expect("Basic Auth keeps working next to tokens");
+        let status = ws_handshake(&auth, "/tcp:127.0.0.1:9", Some(WRONG))
+            .await
+            .err();
+        assert_eq!(status, Some(StatusCode::UNAUTHORIZED));
+    }
+
+    /// Collects what `tracing` logs, so a test can check which address a connection was logged
+    /// under.
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = LogCapture;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Sends `request` from 127.0.0.1 and returns the logs it produced.
+    async fn logs_of(request: &str, trusted_proxies: TrustedProxies) -> String {
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        // The tests run on a current-thread runtime, so the connection task logs on this thread.
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (mut client, server_stream) = duplex(4096);
+        let server = spawn_server_behind(server_stream, None, trusted_proxies);
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        server.await.unwrap().unwrap();
+
+        let logs = capture.0.lock().unwrap().clone();
+        String::from_utf8(logs).unwrap()
+    }
+
+    #[tokio::test]
+    async fn logs_the_client_address_from_a_trusted_proxy() {
+        let request = "GET / HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 10.9.9.9, 203.0.113.7\r\n\r\n";
+
+        let logs = logs_of(request, TrustedProxies::new(IpRange::loopback())).await;
+        assert!(logs.contains("peer_addr=203.0.113.7"), "{logs}");
+        assert!(!logs.contains("10.9.9.9"), "{logs}");
+        assert!(!logs.contains("127.0.0.1"), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn logs_the_peer_address_when_the_proxy_is_not_trusted() {
+        let request = "GET / HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 203.0.113.7\r\n\r\n";
+
+        // Nobody trusted: the header is only what the sender claims.
+        let logs = logs_of(request, TrustedProxies::default()).await;
+        assert!(logs.contains("peer_addr=127.0.0.1:1"), "{logs}");
+        assert!(!logs.contains("203.0.113.7"), "{logs}");
+
+        // Someone else trusted: same.
+        let other = TrustedProxies::new(vec!["10.0.0.0/8".parse().unwrap()]);
+        let logs = logs_of(request, other).await;
+        assert!(logs.contains("peer_addr=127.0.0.1:1"), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn logs_a_websocket_handshake_under_the_forwarded_address_too() {
+        let (client_stream, server_stream) = duplex(4096);
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let server = spawn_server_with_auth(server_stream, None);
+
+        let mut request = "ws://localhost/".into_client_request().unwrap();
+        request
+            .headers_mut()
+            .insert("x-forwarded-for", HeaderValue::from_static("203.0.113.7"));
+        let (mut client, _) = client_async(request, client_stream).await.unwrap();
+        while client.next().await.is_some() {}
+        server.await.unwrap().unwrap();
+
+        let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("websocket health check"), "{logs}");
+        assert!(logs.contains("peer_addr=203.0.113.7"), "{logs}");
     }
 }

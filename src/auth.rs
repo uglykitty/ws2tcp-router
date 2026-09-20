@@ -1,6 +1,5 @@
 use std::{
     fs,
-    net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
     time::Duration,
@@ -8,13 +7,17 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
+use subtle::ConstantTimeEq;
 use tokio_tungstenite::tungstenite::{
     handshake::server::{ErrorResponse, Request},
     http::{StatusCode, header},
 };
 use tracing::{info, warn};
 
-use crate::{args::Args, proxy::request_user_agent, target::parse_target_addr};
+use crate::{
+    args::Args, client_addr::ClientAddr, proxy::request_user_agent, target::parse_target_addr,
+    token::TokenService,
+};
 
 #[derive(Debug)]
 pub struct AuthConfig {
@@ -24,7 +27,14 @@ pub struct AuthConfig {
     anonymous_targets: RwLock<Vec<String>>,
     fixed_anonymous_targets: Vec<String>,
     anonymous_target_file: Option<PathBuf>,
+    /// Always set when the router runs (token authentication is on whenever Basic credentials
+    /// are configured); `None` only for test configurations that model Basic Auth alone.
+    tokens: Option<TokenService>,
 }
+
+const BASIC_CHALLENGE: &str = r#"Basic realm="ws2tcp-router", charset="UTF-8""#;
+pub const BEARER_CHALLENGE: &str = r#"Bearer realm="ws2tcp-router""#;
+pub const BEARER_INVALID_CHALLENGE: &str = r#"Bearer realm="ws2tcp-router", error="invalid_token""#;
 
 const ANONYMOUS_AUTH_USER: &str = "anonymous";
 const INVALID_AUTH_USER: &str = "invalid";
@@ -66,6 +76,7 @@ pub fn build_auth_config(args: &Args) -> Result<Option<AuthConfig>> {
         anonymous_targets: RwLock::new(anonymous_targets),
         fixed_anonymous_targets,
         anonymous_target_file: args.anonymous_target_file.clone(),
+        tokens: Some(TokenService::from_args(args)?),
     }))
 }
 
@@ -201,13 +212,14 @@ fn validate_basic_auth_credential(credential: &str) -> Result<()> {
 pub fn authorize_request(
     request: &Request,
     auth: Option<&AuthConfig>,
-    peer_addr: SocketAddr,
+    peer_addr: ClientAddr,
 ) -> std::result::Result<String, ErrorResponse> {
     let Some(auth) = auth else {
         return Ok(ANONYMOUS_AUTH_USER.to_owned());
     };
 
-    if auth.allows_anonymous_target(request.uri().path()) {
+    let path = request.uri().path();
+    if auth.allows_anonymous_target(path) {
         return Ok(ANONYMOUS_AUTH_USER.to_owned());
     }
 
@@ -215,26 +227,38 @@ pub fn authorize_request(
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
-    let auth_user = authorization
-        .map(|authorization| {
-            basic_auth_username(authorization).unwrap_or_else(|| INVALID_AUTH_USER.to_owned())
-        })
-        .unwrap_or_else(|| ANONYMOUS_AUTH_USER.to_owned());
-    let expected_authorizations = auth
-        .expected_authorizations
-        .read()
-        .expect("basic auth credentials lock poisoned");
-    let authorized = authorization.is_some_and(|authorization| {
-        expected_authorizations
-            .iter()
-            .any(|expected| authorization == expected)
-    });
+    let mut bearer_presented = false;
+    let mut authorized_user = None;
+    let auth_user = match authorization {
+        None => ANONYMOUS_AUTH_USER.to_owned(),
+        Some(authorization) => match bearer_token(authorization) {
+            Some(token) => {
+                bearer_presented = true;
+                authorized_user = auth.verify_access_token(token);
+                authorized_user
+                    .clone()
+                    .unwrap_or_else(|| INVALID_AUTH_USER.to_owned())
+            }
+            None => {
+                authorized_user = auth.basic_user(authorization);
+                basic_auth_username(authorization).unwrap_or_else(|| INVALID_AUTH_USER.to_owned())
+            }
+        },
+    };
 
-    if authorized {
-        Ok(auth_user)
-    } else {
-        warn!(%peer_addr, auth_user = %auth_user, user_agent = %request_user_agent(request), "rejecting websocket request with invalid basic auth");
-        Err(unauthorized_response())
+    match authorized_user {
+        Some(user) => Ok(user),
+        None => {
+            warn!(%peer_addr, auth_user = %auth_user, user_agent = %request_user_agent(request), "rejecting websocket request with invalid credentials");
+            let bearer = auth.tokens.as_ref().map(|_| {
+                if bearer_presented {
+                    BEARER_INVALID_CHALLENGE
+                } else {
+                    BEARER_CHALLENGE
+                }
+            });
+            Err(unauthorized_response(true, bearer))
+        }
     }
 }
 
@@ -251,7 +275,53 @@ impl AuthConfig {
             anonymous_targets: RwLock::new(Vec::new()),
             fixed_anonymous_targets: Vec::new(),
             anonymous_target_file: None,
+            tokens: None,
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_tokens_for_test(credential: &str, tokens: TokenService) -> Self {
+        Self {
+            tokens: Some(tokens),
+            ..Self::with_basic_auth_for_test(credential)
+        }
+    }
+
+    pub fn tokens(&self) -> Option<&TokenService> {
+        self.tokens.as_ref()
+    }
+
+    /// The user whose Basic `Authorization` header is `authorization`, when the credentials match.
+    pub fn basic_user(&self, authorization: &str) -> Option<String> {
+        let expected = self
+            .expected_authorizations
+            .read()
+            .expect("basic auth credentials lock poisoned");
+        // Look at every credential, and compare in constant time, so that how long a rejection
+        // takes reveals nothing about how close a guess was.
+        let matched = expected.iter().fold(false, |matched, expected| {
+            matched | bool::from(authorization.as_bytes().ct_eq(expected.as_bytes()))
+        });
+        matched
+            .then(|| basic_auth_username(authorization))
+            .flatten()
+    }
+
+    /// Whether `user` is (still) one of the configured Basic Auth users.
+    pub fn has_user(&self, user: &str) -> bool {
+        self.expected_authorizations
+            .read()
+            .expect("basic auth credentials lock poisoned")
+            .iter()
+            .any(|expected| basic_auth_username(expected).as_deref() == Some(user))
+    }
+
+    /// The user of a valid access token. A user removed from the credentials loses their tokens.
+    fn verify_access_token(&self, token: &str) -> Option<String> {
+        self.tokens
+            .as_ref()?
+            .verify_access(token)
+            .filter(|user| self.has_user(user))
     }
 
     fn reload_auth_file(&self, path: &Path) -> Result<bool> {
@@ -314,15 +384,26 @@ fn basic_auth_username(authorization: &str) -> Option<String> {
     Some(username.to_owned())
 }
 
-fn unauthorized_response() -> ErrorResponse {
+/// The token of a `Bearer` `Authorization` header. The scheme is case-insensitive (RFC 9110).
+pub fn bearer_token(authorization: &str) -> Option<&str> {
+    let (scheme, token) = authorization.split_once(' ')?;
+    scheme
+        .eq_ignore_ascii_case("bearer")
+        .then_some(token.trim())
+        .filter(|token| !token.is_empty())
+}
+
+/// A `401` offering the Basic challenge and/or the given Bearer challenge.
+pub fn unauthorized_response(basic: bool, bearer: Option<&'static str>) -> ErrorResponse {
     let mut response = ErrorResponse::new(Some("authentication required".to_owned()));
     *response.status_mut() = StatusCode::UNAUTHORIZED;
-    response.headers_mut().insert(
-        header::WWW_AUTHENTICATE,
-        r#"Basic realm="ws2tcp-router", charset="UTF-8""#
-            .parse()
-            .expect("valid WWW-Authenticate header"),
-    );
+    let challenges = basic.then_some(BASIC_CHALLENGE).into_iter().chain(bearer);
+    for challenge in challenges {
+        response.headers_mut().append(
+            header::WWW_AUTHENTICATE,
+            challenge.parse().expect("valid WWW-Authenticate header"),
+        );
+    }
     response
 }
 
@@ -359,6 +440,10 @@ mod tests {
             basic_auth_file: None,
             anonymous_target: Vec::new(),
             anonymous_target_file: None,
+            trusted_proxy: Vec::new(),
+            token_secret_file: None,
+            access_token_ttl: 600,
+            refresh_token_ttl: 604_800,
             tls_cert: None,
             tls_key: None,
             auto_self_signed_cert: false,
@@ -558,6 +643,7 @@ mod tests {
             anonymous_targets: RwLock::new(Vec::new()),
             fixed_anonymous_targets: Vec::new(),
             anonymous_target_file: None,
+            tokens: None,
         };
         let peer_addr = "127.0.0.1:12345".parse().unwrap();
 
@@ -580,6 +666,7 @@ mod tests {
             anonymous_targets: RwLock::new(Vec::new()),
             fixed_anonymous_targets: Vec::new(),
             anonymous_target_file: None,
+            tokens: None,
         };
         let peer_addr = "127.0.0.1:12345".parse().unwrap();
 
@@ -599,6 +686,7 @@ mod tests {
             anonymous_targets: RwLock::new(Vec::new()),
             fixed_anonymous_targets: Vec::new(),
             anonymous_target_file: None,
+            tokens: None,
         };
         let peer_addr = "127.0.0.1:12345".parse().unwrap();
 
@@ -621,6 +709,7 @@ mod tests {
             anonymous_targets: RwLock::new(vec!["ocs.wangguofang.net:8443".to_owned()]),
             fixed_anonymous_targets: Vec::new(),
             anonymous_target_file: None,
+            tokens: None,
         };
         let peer_addr = "127.0.0.1:12345".parse().unwrap();
 
@@ -643,9 +732,58 @@ mod tests {
             anonymous_targets: RwLock::new(vec!["ocs.wangguofang.net:8443".to_owned()]),
             fixed_anonymous_targets: Vec::new(),
             anonymous_target_file: None,
+            tokens: None,
         };
         let peer_addr = "127.0.0.1:12345".parse().unwrap();
 
         assert!(authorize_request(&request, Some(&auth), peer_addr).is_err());
+    }
+
+    #[test]
+    fn access_tokens_of_a_removed_user_are_rejected() {
+        use crate::token::TokenService;
+        use std::time::Duration;
+
+        let tokens = TokenService::new(
+            b"0123456789abcdef0123456789abcdef",
+            Duration::from_secs(600),
+            Duration::from_secs(3600),
+        );
+        let alice = tokens.login("alice").unwrap().access_token;
+        let bob = tokens.login("bob").unwrap().access_token;
+        // Only alice is configured; bob was removed after he logged in.
+        let auth = AuthConfig::with_tokens_for_test("alice:secret", tokens);
+        let peer_addr = "127.0.0.1:12345".parse().unwrap();
+
+        let request = request_with_authorization(Some(&format!("Bearer {alice}")));
+        assert_eq!(
+            authorize_request(&request, Some(&auth), peer_addr).unwrap(),
+            "alice"
+        );
+        let request = request_with_authorization(Some(&format!("Bearer {bob}")));
+        assert!(authorize_request(&request, Some(&auth), peer_addr).is_err());
+    }
+
+    #[test]
+    fn bearer_scheme_is_case_insensitive_and_needs_a_token() {
+        assert_eq!(bearer_token("Bearer abc"), Some("abc"));
+        assert_eq!(bearer_token("bearer abc"), Some("abc"));
+        assert_eq!(bearer_token("BEARER  abc "), Some("abc"));
+        assert_eq!(bearer_token("Bearer "), None);
+        assert_eq!(bearer_token("Bearer"), None);
+        assert_eq!(bearer_token("Basic abc"), None);
+    }
+
+    #[test]
+    fn token_authentication_is_on_whenever_basic_auth_is_configured() {
+        let mut args = default_args();
+        args.basic_auth = vec!["alice:secret".to_owned()];
+        let auth = build_auth_config(&args).unwrap().unwrap();
+
+        assert!(auth.tokens().is_some());
+
+        // Without credentials there is nothing to log in with: authentication is off altogether,
+        // and so are the tokens.
+        assert!(build_auth_config(&default_args()).unwrap().is_none());
     }
 }

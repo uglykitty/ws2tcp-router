@@ -1,8 +1,9 @@
-//! Plain HTTP handling for the health check path.
+//! Plain HTTP handling for the health check path and the token endpoints.
 //!
 //! `tokio-tungstenite` consumes the stream during the handshake and sends nothing back when the
-//! request is not a websocket upgrade. To answer a plain `GET /`, the request head is read first;
-//! everything read is then replayed to the websocket handshake through [`ReplayStream`].
+//! request is not a websocket upgrade. To answer a plain `GET /` or `POST /auth/...`, the request
+//! head is read first; everything read is then replayed to the websocket handshake through
+//! [`ReplayStream`].
 
 use std::{
     io,
@@ -15,8 +16,6 @@ use tokio_tungstenite::tungstenite::{
     handshake::server::{ErrorResponse, Request},
     http::{HeaderValue, Method, Response, StatusCode, header},
 };
-
-use crate::token::TOKEN_HEADER;
 
 const MAX_REQUEST_HEAD: usize = 16 * 1024;
 const MAX_HEADERS: usize = 64;
@@ -44,11 +43,13 @@ where
     Ok(head)
 }
 
-/// Returns the request when `head` is a complete plain (non-upgrade) `GET`/`HEAD /` request.
+/// Returns the request when `head` is a complete plain (non-upgrade) request that this server
+/// answers itself: `GET`/`HEAD /` (the health check), or any method on `/auth/...` (the token
+/// endpoints, which reject the methods they do not serve).
 ///
 /// Anything else, including malformed or partial requests, returns `None` and is left to the
 /// websocket handshake.
-pub fn parse_plain_health_check(head: &[u8]) -> Option<Request> {
+pub fn parse_plain_request(head: &[u8]) -> Option<Request> {
     let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
     let mut parsed = httparse::Request::new(&mut headers);
     if !matches!(parsed.parse(head), Ok(httparse::Status::Complete(_))) {
@@ -56,13 +57,10 @@ pub fn parse_plain_health_check(head: &[u8]) -> Option<Request> {
     }
 
     let method = Method::from_bytes(parsed.method?.as_bytes()).ok()?;
-    if method != Method::GET && method != Method::HEAD {
-        return None;
-    }
-
     let target = parsed.path?;
     let path = target.split(['?', '#']).next().unwrap_or(target);
-    if path != "/" {
+    let is_health_check = path == "/" && (method == Method::GET || method == Method::HEAD);
+    if !is_health_check && !path.starts_with("/auth/") {
         return None;
     }
 
@@ -80,18 +78,13 @@ pub fn parse_plain_health_check(head: &[u8]) -> Option<Request> {
     (!is_upgrade).then_some(request)
 }
 
-/// Builds the `200 OK` response to a plain health check request, carrying `token` in the
-/// [`TOKEN_HEADER`] header.
-pub fn health_check_response(message: &str, token: &str) -> ErrorResponse {
+/// Builds the `200 OK` response to a plain health check request.
+pub fn health_check_response(message: &str) -> ErrorResponse {
     let mut response = Response::new(Some(message.to_owned()));
     *response.status_mut() = StatusCode::OK;
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response.headers_mut().insert(
-        TOKEN_HEADER,
-        HeaderValue::from_str(token).expect("token is base64url, a valid header value"),
     );
     response
 }
@@ -119,10 +112,11 @@ where
         out.push_str(&String::from_utf8_lossy(value.as_bytes()));
         out.push_str("\r\n");
     }
-    out.push_str(&format!(
-        "content-length: {}\r\nconnection: close\r\n\r\n",
-        body.len()
-    ));
+    // A 204 has no body, and must not say how long it is.
+    if status != StatusCode::NO_CONTENT {
+        out.push_str(&format!("content-length: {}\r\n", body.len()));
+    }
+    out.push_str("connection: close\r\n\r\n");
     if include_body {
         out.push_str(body);
     }
@@ -190,13 +184,28 @@ mod tests {
     #[test]
     fn detects_plain_root_request() {
         let head = b"GET / HTTP/1.1\r\nHost: x\r\nUser-Agent: probe/1.0\r\n\r\n";
-        let request = parse_plain_health_check(head).expect("plain health check");
+        let request = parse_plain_request(head).expect("plain health check");
         assert_eq!(request.method(), Method::GET);
         assert_eq!(
             request.headers().get(header::USER_AGENT).unwrap(),
             "probe/1.0"
         );
-        assert!(parse_plain_health_check(b"HEAD /?x=1 HTTP/1.1\r\nHost: x\r\n\r\n").is_some());
+        assert!(parse_plain_request(b"HEAD /?x=1 HTTP/1.1\r\nHost: x\r\n\r\n").is_some());
+    }
+
+    #[test]
+    fn detects_token_endpoint_requests_of_any_method() {
+        for method in ["POST", "GET", "DELETE"] {
+            let head = format!("{method} /auth/token HTTP/1.1\r\nHost: x\r\n\r\n");
+            let request = parse_plain_request(head.as_bytes()).expect("token endpoint request");
+            assert_eq!(request.method().as_str(), method);
+            assert_eq!(request.uri().path(), "/auth/token");
+        }
+
+        // A websocket upgrade is never a plain request, even on an /auth/ path.
+        let upgrade =
+            b"GET /auth/x HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+        assert!(parse_plain_request(upgrade).is_none());
     }
 
     #[test]
@@ -204,11 +213,12 @@ mod tests {
         // Upgrade request, other paths and methods, and partial or malformed heads.
         let upgrade =
             b"GET / HTTP/1.1\r\nHost: x\r\nUpgrade: WebSocket\r\nConnection: Upgrade\r\n\r\n";
-        assert!(parse_plain_health_check(upgrade).is_none());
-        assert!(parse_plain_health_check(b"GET /tcp:h:1 HTTP/1.1\r\nHost: x\r\n\r\n").is_none());
-        assert!(parse_plain_health_check(b"POST / HTTP/1.1\r\nHost: x\r\n\r\n").is_none());
-        assert!(parse_plain_health_check(b"GET / HTTP/1.1\r\nHost: x\r\n").is_none());
-        assert!(parse_plain_health_check(b"\x16\x03\x01garbage").is_none());
+        assert!(parse_plain_request(upgrade).is_none());
+        assert!(parse_plain_request(b"GET /tcp:h:1 HTTP/1.1\r\nHost: x\r\n\r\n").is_none());
+        assert!(parse_plain_request(b"POST / HTTP/1.1\r\nHost: x\r\n\r\n").is_none());
+        assert!(parse_plain_request(b"POST /author HTTP/1.1\r\nHost: x\r\n\r\n").is_none());
+        assert!(parse_plain_request(b"GET / HTTP/1.1\r\nHost: x\r\n").is_none());
+        assert!(parse_plain_request(b"\x16\x03\x01garbage").is_none());
     }
 
     #[tokio::test]

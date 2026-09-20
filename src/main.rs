@@ -5,6 +5,7 @@ use tracing::{info, warn};
 
 mod args;
 mod auth;
+mod client_addr;
 mod http_probe;
 mod listener;
 mod logging;
@@ -12,9 +13,11 @@ mod proxy;
 mod target;
 mod tls;
 mod token;
+mod token_api;
 
 use args::Args;
 use auth::{build_auth_config, spawn_auth_file_reloader};
+use client_addr::TrustedProxies;
 use listener::{bind_listener, resolve_bind_addr};
 use logging::init_logging;
 use proxy::handle_connection;
@@ -31,6 +34,7 @@ async fn main() -> Result<()> {
     let auth = build_auth_config(&args)?.map(Arc::new);
     if let Some(auth) = &auth {
         spawn_auth_file_reloader(Arc::clone(auth));
+        info!("token authentication is on: Bearer access tokens and Basic Auth are both accepted");
     }
     let tls_config = if args.service_mode.includes_wss() {
         build_tls_config(&args)?
@@ -38,6 +42,8 @@ async fn main() -> Result<()> {
         None
     };
     let udp_idle_timeout = Duration::from_secs(args.udp_idle_timeout);
+    let trusted_proxies = Arc::new(TrustedProxies::new(args.trusted_proxy.clone()));
+    info!(trusted_proxies = %trusted_proxies, "reading X-Forwarded-For from these proxies only");
 
     if args.service_mode.includes_ws() {
         let bind_addr = resolve_bind_addr(&args.bind, args.port)?;
@@ -50,6 +56,7 @@ async fn main() -> Result<()> {
             udp_idle_timeout,
             auth.clone(),
             None,
+            Arc::clone(&trusted_proxies),
         ));
     }
 
@@ -68,6 +75,7 @@ async fn main() -> Result<()> {
             udp_idle_timeout,
             auth.clone(),
             Some(tls_config),
+            trusted_proxies,
         ));
     }
 
@@ -82,6 +90,7 @@ async fn serve_listener(
     udp_idle_timeout: Duration,
     auth: Option<Arc<auth::AuthConfig>>,
     tls_config: Option<Arc<ServerConfig>>,
+    trusted_proxies: Arc<TrustedProxies>,
 ) -> Result<()> {
     loop {
         let (stream, peer_addr) = listener
@@ -90,6 +99,7 @@ async fn serve_listener(
             .with_context(|| format!("{scheme} accept failed"))?;
         let auth = auth.clone();
         let tls_config = tls_config.clone();
+        let trusted_proxies = Arc::clone(&trusted_proxies);
 
         tokio::spawn(async move {
             let result = handle_accepted_stream(
@@ -99,6 +109,7 @@ async fn serve_listener(
                 udp_idle_timeout,
                 auth,
                 tls_config,
+                trusted_proxies,
             )
             .await
             .with_context(|| format!("{scheme} connection failed"));
@@ -117,6 +128,7 @@ async fn handle_accepted_stream(
     udp_idle_timeout: Duration,
     auth: Option<Arc<auth::AuthConfig>>,
     tls_config: Option<Arc<ServerConfig>>,
+    trusted_proxies: Arc<TrustedProxies>,
 ) -> Result<()> {
     match tls_config {
         Some(config) => {
@@ -125,8 +137,26 @@ async fn handle_accepted_stream(
                 .accept(stream)
                 .await
                 .context("tls handshake failed")?;
-            handle_connection(stream, peer_addr, buffer_size, auth, udp_idle_timeout).await
+            handle_connection(
+                stream,
+                peer_addr,
+                buffer_size,
+                auth,
+                udp_idle_timeout,
+                trusted_proxies,
+            )
+            .await
         }
-        None => handle_connection(stream, peer_addr, buffer_size, auth, udp_idle_timeout).await,
+        None => {
+            handle_connection(
+                stream,
+                peer_addr,
+                buffer_size,
+                auth,
+                udp_idle_timeout,
+                trusted_proxies,
+            )
+            .await
+        }
     }
 }
