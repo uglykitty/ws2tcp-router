@@ -40,8 +40,8 @@ cargo build --release
 Published images are available from GitHub Container Registry:
 
 ```bash
-podman pull ghcr.io/uglykitty/ws2tcp-router:0.1.17
-podman run --rm -p 8000:8000 ghcr.io/uglykitty/ws2tcp-router:0.1.17
+podman pull ghcr.io/uglykitty/ws2tcp-router:0.2.0
+podman run --rm -p 8000:8000 ghcr.io/uglykitty/ws2tcp-router:0.2.0
 ```
 
 Build the image:
@@ -68,8 +68,8 @@ Docker images and GitHub Release binaries are published by GitHub Actions when
 a version tag is pushed:
 
 ```bash
-git tag v0.1.17
-git push origin v0.1.17
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 The Release contains single-file executables:
@@ -826,7 +826,7 @@ The server tells the client what happened, in one of two ways:
 The text message looks like this:
 
 ```text
-ok: ws2tcp-router 0.1.17 is available; health check only, no upstream connected
+ok: ws2tcp-router 0.2.0 is available; health check only, no upstream connected
 ```
 
 The health check hands out nothing else. Earlier versions returned an unverified
