@@ -1,7 +1,7 @@
 use std::{fs, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
-use clap::{ArgAction, Parser, ValueEnum};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
 
 use crate::client_addr::IpRange;
@@ -16,6 +16,7 @@ const DEFAULT_REFRESH_TOKEN_TTL: u64 = 7 * 24 * 60 * 60;
 
 #[derive(Debug, Clone)]
 pub struct Args {
+    pub command: Option<Command>,
     pub bind: String,
     pub service_mode: ServiceMode,
     pub port: u16,
@@ -36,6 +37,7 @@ pub struct Args {
     pub auto_self_signed_cert: bool,
     pub log_file: Option<PathBuf>,
     pub log_level: Option<String>,
+    pub control_socket: Option<PathBuf>,
 }
 
 impl Args {
@@ -91,6 +93,7 @@ impl Args {
         let tls_port = cli.tls_port.or(config.tls_port).unwrap_or(DEFAULT_TLS_PORT);
 
         let args = Self {
+            command: cli.command,
             bind: cli
                 .bind
                 .or(config.bind)
@@ -144,6 +147,7 @@ impl Args {
             auto_self_signed_cert,
             log_file: cli.log_file.or(config.log_file),
             log_level: cli.log_level.or(config.log_level),
+            control_socket: cli.control_socket.or(config.control_socket),
         };
 
         args.validate()?;
@@ -215,6 +219,12 @@ impl ServiceMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Subcommand)]
+pub enum Command {
+    /// Show the connections a running service has open, read from its control socket.
+    Status,
+}
+
 #[derive(Debug, Parser)]
 #[command(
     author,
@@ -222,6 +232,9 @@ impl ServiceMode {
     about = "Forward WebSocket connections to TCP upstreams"
 )]
 struct CliArgs {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Load options from a TOML configuration file.
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
@@ -319,6 +332,11 @@ struct CliArgs {
     /// Logging filter, overriding RUST_LOG. Example: ws2tcp_router=debug
     #[arg(long, value_name = "FILTER")]
     log_level: Option<String>,
+
+    /// Unix socket that lists the open connections to whoever connects. Default:
+    /// `$XDG_RUNTIME_DIR/ws2tcp-router.sock`.
+    #[arg(long, value_name = "PATH", global = true)]
+    control_socket: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -344,6 +362,7 @@ struct ConfigArgs {
     auto_self_signed_cert: Option<bool>,
     log_file: Option<PathBuf>,
     log_level: Option<String>,
+    control_socket: Option<PathBuf>,
 }
 
 impl ConfigArgs {
@@ -398,6 +417,15 @@ mod tests {
     }
 
     #[test]
+    fn parses_the_status_command() {
+        assert_eq!(parse(&[]).command, None);
+
+        let args = parse(&["status", "--control-socket", "./control.sock"]);
+        assert_eq!(args.command, Some(Command::Status));
+        assert_eq!(args.control_socket, Some(PathBuf::from("./control.sock")));
+    }
+
+    #[test]
     fn reads_values_from_config_file() {
         let path = temp_path("config");
         fs::write(
@@ -419,6 +447,7 @@ tls-key = "./key.pem"
 auto-self-signed-cert = false
 log-file = "./router.log"
 log-level = "ws2tcp_router=debug"
+control-socket = "./control.sock"
 "#,
         )
         .unwrap();
@@ -445,6 +474,7 @@ log-level = "ws2tcp_router=debug"
         assert!(!args.auto_self_signed_cert);
         assert_eq!(args.log_file, Some(PathBuf::from("./router.log")));
         assert_eq!(args.log_level, Some("ws2tcp_router=debug".to_owned()));
+        assert_eq!(args.control_socket, Some(PathBuf::from("./control.sock")));
     }
 
     #[test]

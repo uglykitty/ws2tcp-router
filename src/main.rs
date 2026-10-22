@@ -6,6 +6,7 @@ use tracing::{info, warn};
 mod args;
 mod auth;
 mod client_addr;
+mod control;
 mod http_probe;
 mod listener;
 mod logging;
@@ -15,7 +16,7 @@ mod tls;
 mod token;
 mod token_api;
 
-use args::Args;
+use args::{Args, Command};
 use auth::{build_auth_config, spawn_auth_file_reloader};
 use client_addr::TrustedProxies;
 use listener::{bind_listener, resolve_bind_addr};
@@ -29,6 +30,9 @@ use tokio_rustls::rustls::ServerConfig;
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let args = Args::parse()?;
+    if args.command == Some(Command::Status) {
+        return control::status(args.control_socket).await;
+    }
     let _log_guard = init_logging(&args)?;
 
     let auth = build_auth_config(&args)?.map(Arc::new);
@@ -44,6 +48,18 @@ async fn main() -> Result<()> {
     let udp_idle_timeout = Duration::from_secs(args.udp_idle_timeout);
     let trusted_proxies = Arc::new(TrustedProxies::new(args.trusted_proxy.clone()));
     info!(trusted_proxies = %trusted_proxies, "reading X-Forwarded-For from these proxies only");
+
+    // An explicit path must work; the default one is a convenience that never stops the service.
+    match args.control_socket.clone() {
+        Some(path) => control::serve(path)?,
+        None => {
+            if let Some(path) = control::default_path()
+                && let Err(err) = control::serve(path)
+            {
+                warn!(error = %format_args!("{err:#}"), "control socket is off");
+            }
+        }
+    }
 
     if args.service_mode.includes_ws() {
         let bind_addr = resolve_bind_addr(&args.bind, args.port)?;

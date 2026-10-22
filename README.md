@@ -197,6 +197,9 @@ wss://10.15.108.29/tcp:116.63.8.64:12345
                        Disable automatic self-signed certificate generation from a config file.
 --log-file <PATH>      Append logs to this file instead of standard error.
 --log-level <FILTER>   Logging filter, overriding RUST_LOG. Example: ws2tcp_router=debug
+--control-socket <PATH>
+                       Unix socket that lists the open connections to whoever connects.
+                       Default: $XDG_RUNTIME_DIR/ws2tcp-router.sock
 ```
 
 When binding an IPv6 address without `--ipv6-only`, the listener allows dual-stack
@@ -231,6 +234,7 @@ tls-key = "./key.pem"
 auto-self-signed-cert = false
 log-file = "./logs/ws2tcp-router.log"
 log-level = "ws2tcp_router=info"
+control-socket = "./control.sock"
 ```
 
 Every setting is optional. Missing settings use the same defaults as the CLI.
@@ -255,6 +259,31 @@ to a file instead:
 ```bash
 cargo run -- --bind :: --port 8000 --log-file ./logs/ws2tcp-router.log
 ```
+
+## Control Socket
+
+The service listens on a Unix socket (owner access only, Unix platforms only). By default it
+is `$XDG_RUNTIME_DIR/ws2tcp-router.sock`, following the XDG Base Directory specification;
+without `XDG_RUNTIME_DIR` the socket is off. Use `--control-socket <PATH>` to put it elsewhere,
+for example to run several instances on one host. Every client that connects is sent the
+list of open proxied connections and then disconnected. `ws2tcp-router status` is the client
+for it; it finds the socket the same way (pass `--control-socket <PATH>` if the service uses
+another one):
+
+```bash
+ws2tcp-router status
+```
+
+Any other tool works too, for example `socat - UNIX-CONNECT:"$XDG_RUNTIME_DIR/ws2tcp-router.sock"`.
+
+```text
+2 active connection(s)
+    ID PEER                     USER         PROTO UPSTREAM                         AGE       SENT   RECEIVED  UA
+     3 203.0.113.7:4000         alice        tcp   db.internal:5432              1m05s     2.0KiB      10B  probe/1.0
+     5 198.51.100.2:5123        bob          udp   dns.internal:53                  8s       64B     128B  probe/1.0
+```
+
+`SENT` is payload from the client to the upstream and `RECEIVED` the other way.
 
 ## HTTP Basic Authentication
 

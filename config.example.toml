@@ -38,3 +38,7 @@ udp-idle-timeout = 60
 
 # log-file = "./logs/ws2tcp-router.log"
 # log-level = "ws2tcp_router=info"
+
+# Unix socket that lists the open connections to whoever connects. Default:
+# $XDG_RUNTIME_DIR/ws2tcp-router.sock (off when XDG_RUNTIME_DIR is not set).
+# control-socket = "./control.sock"

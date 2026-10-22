@@ -429,6 +429,7 @@ mod tests {
 
     fn default_args() -> Args {
         Args {
+            command: None,
             bind: "::".to_owned(),
             service_mode: crate::args::ServiceMode::WsOnly,
             port: 80,
@@ -449,6 +450,7 @@ mod tests {
             auto_self_signed_cert: false,
             log_file: None,
             log_level: None,
+            control_socket: None,
         }
     }
 

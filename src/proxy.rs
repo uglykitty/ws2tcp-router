@@ -25,6 +25,7 @@ use tracing::{debug, info, warn};
 use crate::{
     auth::{AuthConfig, authorize_request},
     client_addr::{ClientAddr, TrustedProxies},
+    control::{Session, register},
     http_probe::{
         ReplayStream, health_check_response, parse_plain_request, read_request_head, write_response,
     },
@@ -149,7 +150,8 @@ where
                 .await
                 .with_context(|| format!("failed to connect upstream {}", target.addr()))?;
 
-            proxy_tcp(websocket, tcp, buffer_size).await
+            let session = register(&peer_addr, &auth_user, &user_agent, "tcp", &target.addr());
+            proxy_tcp(websocket, tcp, buffer_size, &session).await
         }
         Protocol::Udp => {
             info!(peer = %peer_addr, user = %auth_user, UA = %user_agent, upstream = %target.addr(), "proxying websocket to udp");
@@ -158,7 +160,8 @@ where
                 .await
                 .with_context(|| format!("failed to connect upstream {}", target.addr()))?;
 
-            proxy_udp(websocket, udp, udp_idle_timeout).await
+            let session = register(&peer_addr, &auth_user, &user_agent, "udp", &target.addr());
+            proxy_udp(websocket, udp, udp_idle_timeout, &session).await
         }
     }
 }
@@ -238,6 +241,7 @@ async fn proxy_tcp<S>(
     websocket: WebSocketStream<S>,
     tcp: TcpStream,
     buffer_size: usize,
+    session: &Session,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -252,9 +256,11 @@ where
                 match message {
                     Some(Ok(Message::Binary(bytes))) => {
                         tcp_writer.write_all(&bytes).await.context("write websocket binary frame to tcp failed")?;
+                        session.add_sent(bytes.len());
                     }
                     Some(Ok(Message::Text(text))) => {
                         tcp_writer.write_all(text.as_bytes()).await.context("write websocket text frame to tcp failed")?;
+                        session.add_sent(text.len());
                     }
                     Some(Ok(Message::Ping(payload))) => {
                         ws_writer.send(Message::Pong(payload)).await.context("send websocket pong failed")?;
@@ -284,6 +290,7 @@ where
                     .send(Message::Binary(tcp_buffer[..n].to_vec().into()))
                     .await
                     .context("send tcp bytes to websocket failed")?;
+                session.add_received(n);
             }
         }
     }
@@ -295,6 +302,7 @@ async fn proxy_udp<S>(
     websocket: WebSocketStream<S>,
     udp: UdpSocket,
     idle_timeout: Duration,
+    session: &Session,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -314,9 +322,11 @@ where
                 match message {
                     Some(Ok(Message::Binary(bytes))) => {
                         udp.send(&bytes).await.context("send websocket binary frame to udp failed")?;
+                        session.add_sent(bytes.len());
                     }
                     Some(Ok(Message::Text(text))) => {
                         udp.send(text.as_bytes()).await.context("send websocket text frame to udp failed")?;
+                        session.add_sent(text.len());
                     }
                     Some(Ok(Message::Ping(payload))) => {
                         ws_writer.send(Message::Pong(payload)).await.context("send websocket pong failed")?;
@@ -343,6 +353,7 @@ where
                     .send(Message::Binary(udp_buffer[..n].to_vec().into()))
                     .await
                     .context("send udp datagram to websocket failed")?;
+                session.add_received(n);
             }
         }
     }
